@@ -565,7 +565,7 @@ dependencies = [
 [[package]]
 name = "eventually"
 version = "0.5.0"
-source = "git+https://github.com/get-eventually/eventually-rs#8a842d7b6f4bb91ec1de4e47adfcd26fe48502eb"
+source = "git+https://github.com/get-eventually/eventually-rs?rev=8a842d7#8a842d7b6f4bb91ec1de4e47adfcd26fe48502eb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -576,13 +576,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventually"
+version = "0.5.0"
+source = "git+https://github.com/get-eventually/eventually-rs#8a842d7b6f4bb91ec1de4e47adfcd26fe48502eb"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eventually-any"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "eventually",
+ "eventually 0.5.0 (git+https://github.com/get-eventually/eventually-rs?rev=8a842d7)",
  "eventually-macros",
  "futures",
  "rand 0.10.0",
@@ -599,7 +611,7 @@ name = "eventually-macros"
 version = "0.1.0"
 source = "git+https://github.com/get-eventually/eventually-rs#8a842d7b6f4bb91ec1de4e47adfcd26fe48502eb"
 dependencies = [
- "eventually",
+ "eventually 0.5.0 (git+https://github.com/get-eventually/eventually-rs)",
  "quote",
  "syn",
 ]
