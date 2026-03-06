@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 chrono = "0.4.44"
-eventually = { rev = "8a842d7", features = [
+eventually = { version = "0.5.0", features = [
     "serde-json",
 ], git = "https://github.com/get-eventually/eventually-rs" }
 futures = "0.3.32"
