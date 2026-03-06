@@ -1,0 +1,42 @@
+[package]
+name = "eventually-any"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+chrono = "0.4.44"
+eventually = { version = "0.5.0", features = [
+    "serde-json",
+], git = "https://github.com/get-eventually/eventually-rs" }
+futures = "0.3.32"
+serde_json = "1.0.149"
+sqlx = { version = "0.8.6", features = [
+    "runtime-tokio-rustls",
+    "any",
+    "migrate",
+    "json",
+] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tokio = { version = "1.50.0", features = ["macros", "rt"] }
+eventually-macros = { git = "https://github.com/get-eventually/eventually-rs", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+rand = "0.10.0"
+testcontainers-modules = { version = "0.15.0", features = [
+    "postgres",
+    "mysql",
+] }
+
+[features]
+default = ["migrations"]
+postgres = ["sqlx/postgres"]
+sqlite = ["sqlx/sqlite"]
+mysql = ["sqlx/mysql"]
+migrations = []
+
+[[example]]
+name = "minimal"
+path = "examples/minimal.rs"
