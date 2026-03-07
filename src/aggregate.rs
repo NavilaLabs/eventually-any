@@ -41,18 +41,24 @@ where
         aggregate_serde: Serde,
         event_serde: EvtSerde,
     ) -> Result<Self, sqlx::migrate::MigrateError> {
-        #[cfg(all(feature = "postgres", feature = "migrations"))]
-        crate::MIGRATIONS_POSTGRES.run(&pool).await?;
-        #[cfg(all(feature = "sqlite", feature = "migrations"))]
-        crate::MIGRATIONS_SQLITE.run(&pool).await?;
-        #[cfg(all(feature = "mysql", feature = "migrations"))]
-        crate::MIGRATIONS_MYSQL.run(&pool).await?;
-
         let backend = pool
             .acquire()
             .await
             .map(|conn| conn.backend_name().to_string())
             .unwrap_or_else(|_| "Unknown".to_string());
+
+        #[cfg(all(feature = "postgres", feature = "migrations"))]
+        if &backend == "PostgreSQL" {
+            crate::MIGRATIONS_POSTGRES.run(&pool).await?;
+        }
+        #[cfg(all(feature = "sqlite", feature = "migrations"))]
+        if &backend == "SQLite" {
+            crate::MIGRATIONS_SQLITE.run(&pool).await?;
+        }
+        #[cfg(all(feature = "mysql", feature = "migrations"))]
+        if &backend == "MySQL" {
+            crate::MIGRATIONS_MYSQL.run(&pool).await?;
+        }
 
         Ok(Self {
             pool,
