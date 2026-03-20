@@ -48,9 +48,9 @@ where
         .serialize(event.message)
         .map_err(|err| anyhow!("failed to serialize event message: {}", err))?;
 
-    metadata.insert("Recorded-At".to_owned(), Utc::now().to_rfc3339());
+    metadata.insert("recorded-at".to_owned(), Utc::now().to_rfc3339());
     metadata.insert(
-        "Recorded-With-New-Version".to_owned(),
+        "recorded-with-new-version".to_owned(),
         new_event_stream_version.to_string(),
     );
     let metadata_string = serde_json::to_string(&metadata).unwrap();

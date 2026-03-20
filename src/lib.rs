@@ -49,6 +49,8 @@ pub mod aggregate;
 #[cfg(feature = "snapshots")]
 pub mod snapshot;
 
+// ── Embedded migrations ───────────────────────────────────────────────────
+
 #[cfg(all(
     feature = "postgres",
     feature = "migrations",
