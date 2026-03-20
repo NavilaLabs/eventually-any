@@ -124,9 +124,7 @@ pub(crate) static MIGRATIONS_MYSQL: sqlx::migrate::Migrator =
 /// Run whichever embedded migration set matches the pool's backend.
 /// No-op when the `migrations` feature is disabled.
 #[allow(unused_variables)] // `pool` unused when no migration feature is on
-pub(crate) async fn run_migrations(
-    pool: &sqlx::AnyPool,
-) -> Result<(), sqlx::migrate::MigrateError> {
+pub async fn run_migrations(pool: &sqlx::AnyPool) -> Result<(), sqlx::migrate::MigrateError> {
     let backend = pool
         .acquire()
         .await
