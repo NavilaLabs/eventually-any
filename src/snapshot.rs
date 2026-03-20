@@ -1,38 +1,52 @@
-//! Append-only snapshot-based aggregate repository for `sqlx::Any` backends.
+//! Periodic-snapshot aggregate repository for `sqlx::Any` backends.
 //!
 //! Available when the `snapshots` feature **is** active.
 //! When `snapshots` is disabled, [`crate::aggregate`] is compiled instead —
 //! it provides an identical public API with classic mutable-row semantics.
 //!
-//! # Why snapshots?
+//! # Strategy
 //!
-//! | Concern | Classic `aggregates` table | Snapshot table |
+//! This repository implements **Option C** — event-only storage with periodic
+//! snapshotting:
+//!
+//! | Concern | Classic `aggregates` | Snapshot (this module) |
 //! |---|---|---|
-//! | Audit trail | None — previous state is overwritten | Full history; each save appends a row |
-//! | Replay cost | Always O(1) reads, but no event history | O(1) read from snapshot + tiny delta |
-//! | Multi-type table | One discriminator column needed | Natural: every row is typed |
-//! | Schema | Mutable `UPDATE` | Immutable `INSERT` |
+//! | Event storage | One mutable row per aggregate | Full immutable event stream |
+//! | Snapshot writes | Always (every save) | Only every N events (configurable) |
+//! | Load strategy | O(1) state read | Latest snapshot + delta event replay |
+//! | Audit trail | ❌ Events only via raw store | ✅ Complete event history always |
 //!
-//! # Loading strategy
+//! ## Saving
+//!
+//! Every [`Repository::save`] call:
+//! 1. Appends the uncommitted events to the `events` table (always).
+//! 2. If the new aggregate version is a multiple of `snapshot_every` (default: 50),
+//!    **also** writes a new snapshot row to the `snapshots` table.
+//!
+//! ## Loading
 //!
 //! [`Repository::get`] uses *snapshot + delta replay*:
-//!
 //! 1. Read the most-recent snapshot row for `(aggregate_type, aggregate_id)`.
-//! 2. Stream all events from the `events` table with `version > snapshot.version`.
+//! 2. Stream all `events` with `version > snapshot.version` (the delta).
 //! 3. Fold delta events via [`eventually::aggregate::Aggregate::apply`].
-//! 4. Wrap the final state in [`eventually::aggregate::Root::rehydrate_from_state`].
+//! 4. Wrap the final state in [`aggregate::Root::rehydrate_from_state`].
 //!
-//! If no snapshot exists, the full event stream is replayed from the beginning
-//! (identical behaviour to [`crate::aggregate`]).
+//! If no snapshot exists yet, the full event stream is replayed from the
+//! beginning — identical to how [`crate::aggregate::Repository`] always works,
+//! but without the O(1) guarantee until the first snapshot is written.
 //!
-//! # Saving strategy
+//! ## Configuring the snapshot interval
 //!
-//! [`Repository::save`] runs a single transaction that:
-//! 1. Reads the current snapshot version for the aggregate (optimistic lock).
-//! 2. Verifies it matches the expected version.
-//! 3. Upserts the `event_streams` version.
-//! 4. Inserts a **new** snapshot row (old rows are kept).
-//! 5. Inserts domain events.
+//! ```rust,ignore
+//! use eventually_any::snapshot::Repository;
+//!
+//! let repo = Repository::new(pool, state_serde, event_serde)
+//!     .await?
+//!     .with_snapshot_every(100); // snapshot every 100 events
+//! ```
+//!
+//! Set to `1` to snapshot on every save (equivalent to the old behaviour).
+//! Set to `usize::MAX` to effectively disable snapshotting (pure event replay).
 //!
 //! # Schema versioning
 //!
@@ -49,15 +63,22 @@ use eventually::aggregate::Aggregate;
 use eventually::version::Version;
 use eventually::{aggregate, event, serde, version};
 use futures::TryStreamExt;
-use sqlx::{Any, AnyPool, Row};
+use sqlx::{AnyPool, Row};
 
 use crate::event::DEFAULT_SCHEMA_VERSION;
 use crate::upcasting::UpcasterChain;
 
-/// Append-only snapshot [`eventually::aggregate::Repository`] for SQL databases.
+/// Default: write a snapshot every 50 events.
+pub const DEFAULT_SNAPSHOT_EVERY: usize = 50;
+
+/// Periodic-snapshot [`eventually::aggregate::Repository`] for SQL databases.
 ///
 /// Identical public API to [`crate::aggregate::Repository`]; switch between
 /// them by toggling the `snapshots` Cargo feature.
+///
+/// Events are **always** appended. A snapshot is only written when the
+/// aggregate version crosses a multiple of [`Self::with_snapshot_every`]
+/// (default: 50).
 #[derive(Debug, Clone)]
 pub struct Repository<T, Serde, EvtSerde>
 where
@@ -72,6 +93,8 @@ where
     backend: String,
     schema_version: u32,
     upcaster_chain: Arc<UpcasterChain>,
+    /// Write a snapshot whenever `new_version % snapshot_every == 0`.
+    snapshot_every: usize,
     t: PhantomData<T>,
 }
 
@@ -108,6 +131,7 @@ where
             backend,
             schema_version: DEFAULT_SCHEMA_VERSION,
             upcaster_chain: Arc::new(UpcasterChain::new()),
+            snapshot_every: DEFAULT_SNAPSHOT_EVERY,
             t: PhantomData,
         })
     }
@@ -124,6 +148,26 @@ where
     pub fn with_upcaster_chain(mut self, chain: UpcasterChain) -> Self {
         self.upcaster_chain = Arc::new(chain);
         self
+    }
+
+    /// Configure how often snapshots are written.
+    ///
+    /// A snapshot is written after any save where
+    /// `new_aggregate_version % snapshot_every == 0`.
+    ///
+    /// - `1`  → snapshot on every save (eager, minimises replay cost)
+    /// - `50` → snapshot every 50 events (default, balanced)
+    /// - `usize::MAX` → effectively disabled (always full replay)
+    #[must_use]
+    pub fn with_snapshot_every(mut self, n: usize) -> Self {
+        assert!(n > 0, "snapshot_every must be > 0");
+        self.snapshot_every = n;
+        self
+    }
+
+    /// Returns how many events trigger a snapshot write.
+    pub fn snapshot_every(&self) -> usize {
+        self.snapshot_every
     }
 }
 
@@ -153,7 +197,7 @@ where
     }
 
     /// Fetch the latest snapshot for `(aggregate_type, aggregate_id)`.
-    /// Returns `(version, state_bytes)` or `None` if no snapshot exists yet.
+    /// Returns `(snapshot_version, state_bytes)` or `None` if none exists yet.
     async fn latest_snapshot(
         &self,
         aggregate_id: &str,
@@ -162,7 +206,9 @@ where
         let ver = self.version_col();
 
         let query = format!(
-            "SELECT {ver}, state FROM snapshots WHERE aggregate_type = {p1} AND aggregate_id = {p2} ORDER BY {ver} DESC LIMIT 1"
+            "SELECT {ver}, state FROM snapshots
+             WHERE aggregate_type = {p1} AND aggregate_id = {p2}
+             ORDER BY {ver} DESC LIMIT 1"
         );
 
         let row = sqlx::query(&query)
@@ -197,134 +243,28 @@ where
         Ok(Some((version as Version, state_bytes)))
     }
 
-    /// Read the snapshot version currently stored for this aggregate (0 if none).
-    /// Used inside a transaction for the optimistic-lock check on save.
-    async fn current_snapshot_version(
+    /// Write a snapshot row inside an existing transaction.
+    ///
+    /// Called only when `new_version % snapshot_every == 0`.
+    async fn write_snapshot_in_tx(
         &self,
-        tx: &mut sqlx::Transaction<'_, Any>,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         aggregate_id: &str,
-    ) -> Result<i32, aggregate::repository::SaveError> {
-        let (p1, p2) = (self.ph(1), self.ph(2));
-        let ver = self.version_col();
-
-        let query = format!(
-            "SELECT {ver} FROM snapshots WHERE aggregate_type = {p1} AND aggregate_id = {p2} ORDER BY {ver} DESC LIMIT 1"
-        );
-
-        let row = sqlx::query(&query)
-            .bind(T::type_name())
-            .bind(aggregate_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|err| {
-                aggregate::repository::SaveError::Internal(anyhow!(
-                    "failed to read current snapshot version: {}",
-                    err
-                ))
-            })?;
-
-        Ok(row.map(|r| r.try_get("version").unwrap_or(0)).unwrap_or(0))
-    }
-
-    /// Upsert `event_streams` and insert a new snapshot row inside `tx`.
-    async fn write_snapshot(
-        &self,
-        tx: &mut sqlx::Transaction<'_, Any>,
-        aggregate_id: &str,
-        expected_version: Version,
+        new_version: i32,
         root: &aggregate::Root<T>,
     ) -> Result<(), aggregate::repository::SaveError> {
-        // ── Optimistic lock ───────────────────────────────────────────────
-        let actual = self.current_snapshot_version(tx, aggregate_id).await?;
-
-        if actual != expected_version as i32 {
-            return Err(aggregate::repository::SaveError::Conflict(
-                version::ConflictError {
-                    expected: expected_version,
-                    actual: actual as Version,
-                },
-            ));
-        }
-
-        // ── Serialise state ───────────────────────────────────────────────
         let state_bytes = self
             .aggregate_serde
             .serialize(root.to_aggregate_type::<T>())
             .map_err(|err| {
                 aggregate::repository::SaveError::Internal(anyhow!(
-                    "failed to serialise aggregate state: {}",
+                    "failed to serialise aggregate state for snapshot: {}",
                     err
                 ))
             })?;
 
-        let new_version = root.version() as i32;
-        let (p1, p2, p3) = (self.ph(1), self.ph(2), self.ph(3));
+        let (p1, p2, p3, p4, p5) = (self.ph(1), self.ph(2), self.ph(3), self.ph(4), self.ph(5));
 
-        // ── Upsert event_streams ──────────────────────────────────────────
-        if expected_version == 0 {
-            let insert =
-                format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
-            if let Err(err) = sqlx::query(&insert)
-                .bind(aggregate_id)
-                .bind(new_version)
-                .execute(&mut **tx)
-                .await
-            {
-                let is_dup = err.as_database_error().map_or(false, |e| {
-                    let code = e.code().unwrap_or_default();
-                    code == "23505" || code == "1062" || code == "23000" || code == "2067"
-                });
-                if is_dup {
-                    return Err(aggregate::repository::SaveError::Conflict(
-                        version::ConflictError {
-                            expected: expected_version,
-                            actual: expected_version + 1,
-                        },
-                    ));
-                }
-                return Err(aggregate::repository::SaveError::Internal(anyhow!(
-                    "failed to insert event stream: {}",
-                    err
-                )));
-            }
-        } else {
-            let update = format!(
-                "UPDATE event_streams SET version = {p1} WHERE event_stream_id = {p2} AND version = {p3}"
-            );
-            match sqlx::query(&update)
-                .bind(new_version)
-                .bind(aggregate_id)
-                .bind(expected_version as i32)
-                .execute(&mut **tx)
-                .await
-            {
-                Ok(res) if res.rows_affected() == 0 => {
-                    return Err(aggregate::repository::SaveError::Conflict(
-                        version::ConflictError {
-                            expected: expected_version,
-                            actual: expected_version + 1,
-                        },
-                    ));
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    return Err(aggregate::repository::SaveError::Internal(anyhow!(
-                        "failed to update event stream: {}",
-                        err
-                    )));
-                }
-            }
-        }
-
-        // ── Insert new snapshot row ───────────────────────────────────────
-        let (p1, p2, p3, p4, p5, p6) = (
-            self.ph(1),
-            self.ph(2),
-            self.ph(3),
-            self.ph(4),
-            self.ph(5),
-            self.ph(6),
-        );
         let snap_insert = if self.backend == "MySQL" {
             format!(
                 "INSERT INTO snapshots
@@ -333,18 +273,16 @@ where
             )
         } else {
             format!(
-                r#"INSERT INTO snapshots
-                 (aggregate_type, aggregate_id, event_stream_id, "version", state)
-                 VALUES ({p1}, {p2}, {p3}, {p4}, {p5})"#
+                "INSERT INTO snapshots
+                 (aggregate_type, aggregate_id, event_stream_id, \"version\", state)
+                 VALUES ({p1}, {p2}, {p3}, {p4}, {p5})"
             )
         };
-
-        let _ = &p6;
 
         sqlx::query(&snap_insert)
             .bind(T::type_name())
             .bind(aggregate_id)
-            .bind(aggregate_id)
+            .bind(aggregate_id) // event_stream_id == aggregate_id
             .bind(new_version)
             .bind(state_bytes)
             .execute(&mut **tx)
@@ -374,7 +312,7 @@ where
     async fn get(&self, id: &T::Id) -> Result<aggregate::Root<T>, aggregate::repository::GetError> {
         let aggregate_id = id.to_string();
 
-        // ── Step 1: latest snapshot ───────────────────────────────────────
+        // ── Step 1: latest snapshot (may be None) ─────────────────────────
         let snapshot = self.latest_snapshot(&aggregate_id).await?;
 
         let (base_state, replay_from): (Option<T>, Version) = match snapshot {
@@ -393,7 +331,7 @@ where
             }
         };
 
-        // ── Step 2: collect delta events ──────────────────────────────────
+        // ── Step 2: stream delta events (from snapshot version + 1) ───────
         let from_select = if replay_from == 0 {
             event::VersionSelect::All
         } else {
@@ -424,7 +362,12 @@ where
                 })?
         };
 
-        // ── Step 3: fold delta onto base state ────────────────────────────
+        // ── Step 3: nothing at all → NotFound ─────────────────────────────
+        if base_state.is_none() && delta_events.is_empty() {
+            return Err(aggregate::repository::GetError::NotFound);
+        }
+
+        // ── Step 4: fold delta events onto base state ─────────────────────
         let (final_state, final_version) = {
             let mut state = base_state;
             let mut version = replay_from;
@@ -469,6 +412,10 @@ where
             return Ok(());
         }
 
+        let aggregate_id = root.aggregate_id().to_string();
+        let new_version = root.version() as i32;
+        let expected_version = root.version() - (events_to_commit.len() as Version);
+
         let mut tx = self.pool.begin().await.map_err(|err| {
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to begin transaction: {}",
@@ -488,18 +435,22 @@ where
                 })?;
         }
 
-        let aggregate_id = root.aggregate_id().to_string();
-        let expected_version = root.version() - (events_to_commit.len() as Version);
-
-        self.write_snapshot(&mut tx, &aggregate_id, expected_version, root)
+        // ── OCC: upsert event_streams with version check ───────────────────
+        //
+        // We use event_streams as the OCC fence — the same table the raw
+        // event store uses. This means concurrent saves to the same aggregate
+        // will correctly conflict even though we no longer have a single
+        // mutable aggregates row to compare against.
+        self.upsert_event_stream(&mut tx, &aggregate_id, expected_version, new_version)
             .await?;
 
+        // ── Always: append events ─────────────────────────────────────────
         #[allow(clippy::cast_possible_truncation)]
         crate::event::append_domain_events(
             &mut tx,
             &self.event_serde,
             &aggregate_id,
-            root.version() as i32,
+            new_version,
             self.schema_version,
             events_to_commit,
         )
@@ -511,6 +462,21 @@ where
             ))
         })?;
 
+        // ── Conditionally: write snapshot ─────────────────────────────────
+        //
+        // A snapshot is written when the new version is a positive multiple
+        // of `snapshot_every`.  This means:
+        //   - snapshot_every = 1  → every save
+        //   - snapshot_every = 50 → versions 50, 100, 150, …
+        //   - snapshot_every = MAX → never (pure event replay)
+        let should_snapshot =
+            self.snapshot_every > 0 && (root.version() as usize) % self.snapshot_every == 0;
+
+        if should_snapshot {
+            self.write_snapshot_in_tx(&mut tx, &aggregate_id, new_version, root)
+                .await?;
+        }
+
         tx.commit().await.map_err(|err| {
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to commit transaction: {}",
@@ -518,6 +484,122 @@ where
             ))
         })?;
 
+        Ok(())
+    }
+}
+
+impl<T, Serde, EvtSerde> Repository<T, Serde, EvtSerde>
+where
+    T: Aggregate + Send + Sync,
+    <T as Aggregate>::Id: ToString,
+    Serde: serde::Serde<T> + Send + Sync,
+    EvtSerde: serde::Serde<T::Event> + Send + Sync,
+{
+    /// Insert (first save) or update (subsequent saves) the `event_streams` row,
+    /// using the expected version as an optimistic lock.
+    async fn upsert_event_stream(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        aggregate_id: &str,
+        expected_version: Version,
+        new_version: i32,
+    ) -> Result<(), aggregate::repository::SaveError> {
+        let (p1, p2) = (self.ph(1), self.ph(2));
+
+        if expected_version == 0 {
+            // First save: INSERT the stream row.
+            let insert =
+                format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
+            if let Err(err) = sqlx::query(&insert)
+                .bind(aggregate_id)
+                .bind(new_version)
+                .execute(&mut **tx)
+                .await
+            {
+                let is_dup = err.as_database_error().map_or(false, |e| {
+                    let code = e.code().unwrap_or_default();
+                    // 23505 = Postgres unique violation
+                    // 1062  = MySQL duplicate entry
+                    // 23000 = MySQL integrity constraint
+                    // 2067  = SQLite UNIQUE constraint (extended code)
+                    // 1555  = SQLite PRIMARY KEY constraint (extended code, seen in practice)
+                    code == "23505"
+                        || code == "1062"
+                        || code == "23000"
+                        || code == "2067"
+                        || code == "1555"
+                });
+                if is_dup {
+                    return Err(aggregate::repository::SaveError::Conflict(
+                        version::ConflictError {
+                            expected: expected_version,
+                            actual: expected_version + 1,
+                        },
+                    ));
+                }
+                return Err(aggregate::repository::SaveError::Internal(anyhow!(
+                    "failed to insert event stream: {}",
+                    err
+                )));
+            }
+        } else {
+            // Subsequent saves: UPDATE only when version matches — this is the OCC check.
+            let (p3) = self.ph(3);
+            let update = format!(
+                "UPDATE event_streams SET version = {p1}
+                 WHERE event_stream_id = {p2} AND version = {p3}"
+            );
+            match sqlx::query(&update)
+                .bind(new_version)
+                .bind(aggregate_id)
+                .bind(expected_version as i32)
+                .execute(&mut **tx)
+                .await
+            {
+                Ok(res) if res.rows_affected() == 0 => {
+                    // No row matched — someone else advanced the version.
+                    // Read the actual current version for a useful error message.
+                    let sel = if self.backend == "MySQL" {
+                        "SELECT version FROM event_streams WHERE event_stream_id = ?"
+                    } else {
+                        "SELECT version FROM event_streams WHERE event_stream_id = $1"
+                    };
+                    let actual: i32 = sqlx::query(sel)
+                        .bind(aggregate_id)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|r| r.try_get("version").ok())
+                        .unwrap_or(0);
+
+                    return Err(aggregate::repository::SaveError::Conflict(
+                        version::ConflictError {
+                            expected: expected_version,
+                            actual: actual as Version,
+                        },
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    let is_serial = err
+                        .as_database_error()
+                        .map_or(false, |e| e.code().unwrap_or_default() == "40001");
+                    if is_serial {
+                        return Err(aggregate::repository::SaveError::Conflict(
+                            version::ConflictError {
+                                expected: expected_version,
+                                actual: expected_version + 1,
+                            },
+                        ));
+                    }
+                    return Err(aggregate::repository::SaveError::Internal(anyhow!(
+                        "failed to update event stream: {}",
+                        err
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }

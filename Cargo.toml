@@ -41,6 +41,7 @@ snapshots = []
 [[example]]
 name = "bank_account"
 path = "examples/bank_account.rs"
+required-features = ["sqlite", "migrations"]
 # Demonstrates the full aggregate lifecycle: open, deposit, withdraw, reload,
 # domain errors, and closing. Uses the classic aggregate::Repository.
 # Run: cargo run --example bank_account --features sqlite,migrations
@@ -49,6 +50,7 @@ path = "examples/bank_account.rs"
 [[example]]
 name = "order_lifecycle"
 path = "examples/order_lifecycle.rs"
+required-features = ["sqlite", "migrations"]
 # Demonstrates raw event-store usage: multi-batch appends, VersionSelect::All,
 # VersionSelect::From (checkpoint resume), metadata inspection, and projection
 # rebuilding.
@@ -57,6 +59,7 @@ path = "examples/order_lifecycle.rs"
 [[example]]
 name = "concurrent_writes"
 path = "examples/concurrent_writes.rs"
+required-features = ["sqlite", "migrations"]
 # Demonstrates Optimistic Concurrency Control at both the event-store and
 # aggregate-repository levels, plus a realistic optimistic retry loop.
 # Run: cargo run --example concurrent_writes --features sqlite,migrations
@@ -64,6 +67,7 @@ path = "examples/concurrent_writes.rs"
 [[example]]
 name = "snapshot_repository"
 path = "examples/snapshot_repository.rs"
+required-features = ["sqlite", "snapshots", "migrations"]
 # Demonstrates the snapshot::Repository: append-only snapshots, full audit
 # trail, delta replay, and two aggregate types coexisting in the same table.
 # Run: cargo run --example snapshot_repository --features sqlite,snapshots,migrations
@@ -71,6 +75,7 @@ path = "examples/snapshot_repository.rs"
 [[example]]
 name = "multi_schema_upcasting"
 path = "examples/multi_schema_upcasting.rs"
+required-features = ["sqlite", "migrations"]
 # Demonstrates three-generation schema migration (V1→V2→V3) using named-struct
 # Upcaster implementations, chained automatically by UpcasterChain.
 # Run: cargo run --example multi_schema_upcasting --features sqlite,migrations
@@ -78,6 +83,7 @@ path = "examples/multi_schema_upcasting.rs"
 [[example]]
 name = "multi_database"
 path = "examples/multi_database.rs"
+required-features = ["sqlite", "postgres", "mysql", "migrations"]
 # Demonstrates running identical domain logic against SQLite, PostgreSQL, and
 # MySQL by switching only the connection string. Asserts identical results.
 # Run: cargo run --example multi_database --features sqlite,postgres,mysql,migrations
