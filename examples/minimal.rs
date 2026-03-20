@@ -73,10 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     for persisted in events {
-        println!(
-            "   - Version {}: {:?}",
-            persisted.version, persisted.event.message
-        );
+        println!("   - Version {}: {:?}", persisted.version, persisted);
     }
 
     Ok(())

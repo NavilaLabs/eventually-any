@@ -31,11 +31,12 @@ testcontainers-modules = { version = "0.15.0", features = [
 ] }
 
 [features]
-default = ["migrations"]
+default = []
 postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
 mysql = ["sqlx/mysql"]
 migrations = []
+snapshots = []
 
 [[example]]
 name = "minimal"

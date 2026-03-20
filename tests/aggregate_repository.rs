@@ -1,3 +1,5 @@
+#![cfg(not(feature = "snapshots"))]
+
 use eventually::aggregate::repository::{self, GetError, Getter, Saver};
 use eventually::serde;
 use eventually_any::aggregate;

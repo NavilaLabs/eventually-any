@@ -13,6 +13,8 @@ use futures::{StreamExt, TryStreamExt};
 use sqlx::any::AnyRow;
 use sqlx::{Any, AnyPool, Row, Transaction};
 
+// ── Error types ───────────────────────────────────────────────────────────
+
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
     #[error("failed to deserialize event from database: {0}")]
@@ -26,6 +28,8 @@ pub enum StreamError {
     #[error("db returned an error: {0}")]
     Database(#[source] sqlx::Error),
 }
+
+// ── Internal helpers ──────────────────────────────────────────────────────
 
 pub(crate) async fn append_domain_event<Evt>(
     tx: &mut Transaction<'_, Any>,
@@ -85,24 +89,21 @@ where
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let current_event_stream_version = new_version - (events.len() as i32);
 
-    for (i, event) in events.into_iter().enumerate() {
+    for (i, evt) in events.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let event_version = current_event_stream_version + (i as i32) + 1;
 
-        append_domain_event(
-            tx,
-            serde,
-            event_stream_id,
-            event_version,
-            new_version,
-            event,
-        )
-        .await?;
+        append_domain_event(tx, serde, event_stream_id, event_version, new_version, evt).await?;
     }
 
     Ok(())
 }
 
+// ── Store ─────────────────────────────────────────────────────────────────
+
+/// `sqlx::Any`-backed [`event::Store`] implementation.
+///
+/// Supports PostgreSQL, SQLite and MySQL transparently via the same pool.
 #[derive(Debug, Clone)]
 pub struct Store<Id, Evt, Serde>
 where
@@ -121,25 +122,20 @@ where
     Id: ToString + Clone,
     Serde: serde::Serde<Evt>,
 {
+    /// Run migrations (if the `migrations` feature is active) and return a
+    /// new [`Store`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the migrations fail to run.
     pub async fn new(pool: AnyPool, serde: Serde) -> Result<Self, sqlx::migrate::MigrateError> {
         let backend = pool
             .acquire()
             .await
-            .map(|conn| conn.backend_name().to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
+            .map(|c| c.backend_name().to_string())
+            .unwrap_or_default();
 
-        #[cfg(all(feature = "postgres", feature = "migrations"))]
-        if &backend == "PostgreSQL" {
-            crate::MIGRATIONS_POSTGRES.run(&pool).await?;
-        }
-        #[cfg(all(feature = "sqlite", feature = "migrations"))]
-        if &backend == "SQLite" {
-            crate::MIGRATIONS_SQLITE.run(&pool).await?;
-        }
-        #[cfg(all(feature = "mysql", feature = "migrations"))]
-        if &backend == "MySQL" {
-            crate::MIGRATIONS_MYSQL.run(&pool).await?;
-        }
+        crate::run_migrations(&pool).await?;
 
         Ok(Self {
             pool,
@@ -149,7 +145,28 @@ where
             evt_type: PhantomData,
         })
     }
+
+    /// Create a [`Store`] that skips migrations.
+    ///
+    /// `pub(crate)` — used by [`crate::snapshot::Repository`] to build a
+    /// lightweight streamer for delta-event replay inside `get()`, where
+    /// migrations have already been run by the outer `Repository::new`.
+    #[cfg(feature = "snapshots")]
+    pub(crate) fn new_unchecked(pool: AnyPool, serde: &Serde, backend: &str) -> Self
+    where
+        Serde: Clone,
+    {
+        Self {
+            pool,
+            serde: serde.clone(),
+            backend: backend.to_owned(),
+            id_type: PhantomData,
+            evt_type: PhantomData,
+        }
+    }
 }
+
+// ── Row helper ────────────────────────────────────────────────────────────
 
 fn try_get_column<T>(row: &AnyRow, name: &'static str) -> Result<T, StreamError>
 where
@@ -173,7 +190,8 @@ where
         let version_column: i32 = try_get_column(row, "version")?;
         let event_column: Vec<u8> = try_get_column(row, "event")?;
 
-        // Robust fetch: try parsing metadata as String, fallback to Vec<u8> (for MySQL JSON/BLOBs)
+        // Metadata is stored as JSONB (Postgres), JSON (MySQL) or TEXT (SQLite).
+        // Try String first, then fall back to Vec<u8> for MySQL JSON blobs.
         let metadata_column: String = try_get_column(row, "metadata").or_else(|_| {
             try_get_column::<Vec<u8>>(row, "metadata")
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -199,6 +217,8 @@ where
     }
 }
 
+// ── Streamer ──────────────────────────────────────────────────────────────
+
 impl<Id, Evt, Serde> event::store::Streamer<Id, Evt> for Store<Id, Evt, Serde>
 where
     Id: ToString + Clone + Send + Sync,
@@ -220,13 +240,22 @@ where
 
         let query_str = match self.backend.as_str() {
             "PostgreSQL" => {
-                r"SELECT version, event, CAST(metadata AS text) as metadata FROM events WHERE event_stream_id = $1 AND version >= $2 ORDER BY version"
+                r#"SELECT version, event, CAST(metadata AS text) as metadata
+                   FROM events
+                   WHERE event_stream_id = $1 AND version >= $2
+                   ORDER BY version"#
             }
             "MySQL" => {
-                r"SELECT version, event, CAST(metadata AS char) as metadata FROM events WHERE event_stream_id = ? AND version >= ? ORDER BY version"
+                r"SELECT version, event, CAST(metadata AS char) as metadata
+                   FROM events
+                   WHERE event_stream_id = ? AND version >= ?
+                   ORDER BY version"
             }
             _ => {
-                r"SELECT version, event, metadata FROM events WHERE event_stream_id = $1 AND version >= $2 ORDER BY version"
+                r#"SELECT version, event, metadata
+                   FROM events
+                   WHERE event_stream_id = $1 AND version >= $2
+                   ORDER BY version"#
             }
         };
 
@@ -241,6 +270,8 @@ where
             .boxed()
     }
 }
+
+// ── Appender ──────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl<Id, Evt, Serde> event::store::Appender<Id, Evt> for Store<Id, Evt, Serde>
@@ -282,6 +313,7 @@ where
             } else {
                 "SELECT version FROM event_streams WHERE event_stream_id = $1"
             };
+
             let current_version_row = sqlx::query(select_query)
                 .bind(&string_id)
                 .fetch_optional(&mut *tx)
@@ -340,17 +372,12 @@ where
                 Ok(res) => {
                     if current_version > 0 && res.rows_affected() == 0 {
                         if let version::Check::MustBe(v) = version_check {
-                            let select_query = if self.backend == "MySQL" {
-                                "SELECT version FROM event_streams WHERE event_stream_id = ?"
-                            } else {
-                                "SELECT version FROM event_streams WHERE event_stream_id = $1"
-                            };
                             let actual_row = sqlx::query(select_query)
                                 .bind(&string_id)
                                 .fetch_optional(&mut *tx)
                                 .await
                                 .unwrap_or(None);
-                            let actual = actual_row
+                            let actual: i32 = actual_row
                                 .map(|row| row.try_get("version").unwrap_or(0))
                                 .unwrap_or(0);
                             return Err(event::store::AppendError::Conflict(
@@ -372,7 +399,6 @@ where
                 Err(err) => {
                     let is_conflict = err.as_database_error().map_or(false, |e| {
                         let code = e.code().unwrap_or_default();
-                        // 23000 catches MySQL's duplicate entry Integrity Constraint
                         code == "23505"
                             || code == "1062"
                             || code == "2067"
