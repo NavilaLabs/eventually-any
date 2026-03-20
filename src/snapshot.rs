@@ -33,8 +33,15 @@
 //! 3. Upserts the `event_streams` version.
 //! 4. Inserts a **new** snapshot row (old rows are kept).
 //! 5. Inserts domain events.
+//!
+//! # Schema versioning
+//!
+//! The [`Repository`] forwards `schema_version` and an [`UpcasterChain`] to
+//! its inner event store, so all delta-replay reads go through the upcasting
+//! pipeline automatically.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -43,6 +50,9 @@ use eventually::version::Version;
 use eventually::{aggregate, event, serde, version};
 use futures::TryStreamExt;
 use sqlx::{Any, AnyPool, Row};
+
+use crate::event::DEFAULT_SCHEMA_VERSION;
+use crate::upcasting::UpcasterChain;
 
 /// Append-only snapshot [`eventually::aggregate::Repository`] for SQL databases.
 ///
@@ -60,6 +70,8 @@ where
     aggregate_serde: Serde,
     event_serde: EvtSerde,
     backend: String,
+    schema_version: u32,
+    upcaster_chain: Arc<UpcasterChain>,
     t: PhantomData<T>,
 }
 
@@ -94,8 +106,24 @@ where
             aggregate_serde,
             event_serde,
             backend,
+            schema_version: DEFAULT_SCHEMA_VERSION,
+            upcaster_chain: Arc::new(UpcasterChain::new()),
             t: PhantomData,
         })
+    }
+
+    /// Set the schema version stamped on newly-written events.
+    #[must_use]
+    pub fn with_schema_version(mut self, version: u32) -> Self {
+        self.schema_version = version;
+        self
+    }
+
+    /// Attach an [`UpcasterChain`] applied to events at read time.
+    #[must_use]
+    pub fn with_upcaster_chain(mut self, chain: UpcasterChain) -> Self {
+        self.upcaster_chain = Arc::new(chain);
+        self
     }
 }
 
@@ -289,7 +317,6 @@ where
         }
 
         // ── Insert new snapshot row ───────────────────────────────────────
-        // MySQL uses backtick-quoted `version`; Postgres/SQLite use "version".
         let (p1, p2, p3, p4, p5, p6) = (
             self.ph(1),
             self.ph(2),
@@ -312,15 +339,14 @@ where
             )
         };
 
-        // p6 is unused here but the variable was pre-bound above; suppress lint.
         let _ = &p6;
 
         sqlx::query(&snap_insert)
-            .bind(T::type_name()) // aggregate_type
-            .bind(aggregate_id) // aggregate_id
-            .bind(aggregate_id) // event_stream_id (same as aggregate_id)
-            .bind(new_version) // version
-            .bind(state_bytes) // state
+            .bind(T::type_name())
+            .bind(aggregate_id)
+            .bind(aggregate_id)
+            .bind(new_version)
+            .bind(state_bytes)
             .execute(&mut **tx)
             .await
             .map_err(|err| {
@@ -345,12 +371,6 @@ where
     Serde: serde::Serde<T> + Send + Sync,
     EvtSerde: serde::Serde<T::Event> + Send + Sync + Clone,
 {
-    /// Load an aggregate root via *snapshot + delta replay*:
-    ///
-    /// 1. Read the most-recent snapshot → base state + version.
-    /// 2. Stream events after that version → delta.
-    /// 3. Fold delta via `T::apply`.
-    /// 4. Return `Root::rehydrate_from_state(final_version, final_state)`.
     async fn get(&self, id: &T::Id) -> Result<aggregate::Root<T>, aggregate::repository::GetError> {
         let aggregate_id = id.to_string();
 
@@ -384,6 +404,8 @@ where
             self.pool.clone(),
             &self.event_serde,
             &self.backend,
+            self.schema_version,
+            Arc::clone(&self.upcaster_chain),
         );
 
         let delta_events: Vec<event::Envelope<T::Event>> = {
@@ -437,15 +459,6 @@ where
     Serde: serde::Serde<T> + Send + Sync,
     EvtSerde: serde::Serde<T::Event> + Send + Sync,
 {
-    /// Persist uncommitted events **and** a new snapshot in a single
-    /// transaction.
-    ///
-    /// Transaction order:
-    /// 1. Optimistic-lock check (compare snapshot version).
-    /// 2. Upsert `event_streams`.
-    /// 3. Insert new snapshot row.
-    /// 4. Insert domain events.
-    /// 5. Commit.
     async fn save(
         &self,
         root: &mut aggregate::Root<T>,
@@ -478,17 +491,16 @@ where
         let aggregate_id = root.aggregate_id().to_string();
         let expected_version = root.version() - (events_to_commit.len() as Version);
 
-        // ── 1–4: snapshot + event_streams upsert ─────────────────────────
         self.write_snapshot(&mut tx, &aggregate_id, expected_version, root)
             .await?;
 
-        // ── 5: domain events ──────────────────────────────────────────────
         #[allow(clippy::cast_possible_truncation)]
         crate::event::append_domain_events(
             &mut tx,
             &self.event_serde,
             &aggregate_id,
             root.version() as i32,
+            self.schema_version,
             events_to_commit,
         )
         .await

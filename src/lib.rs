@@ -31,6 +31,42 @@
 //! (`Repository<T, Serde, EvtSerde>`, `Getter`, `Saver`) so switching
 //! between them is purely a feature-flag change — no application code needs
 //! to change.
+//!
+//! # Event schema versioning
+//!
+//! Every event row carries a `schema_version` integer column.  When your
+//! event payload format changes, you:
+//!
+//! 1. Bump [`event::Store::with_schema_version`] to the new version number.
+//! 2. Implement [`upcasting::Upcaster`] (or use [`upcasting::FnUpcaster`])
+//!    for each old-version → new-version transition.
+//! 3. Register upcasters via [`event::Store::with_upcaster_chain`].
+//!
+//! Old events stored in the database are transparently upgraded at read time;
+//! no data migration is required.
+//!
+//! ```rust,ignore
+//! use eventually_any::event::Store;
+//! use eventually_any::upcasting::{FnUpcaster, UpcasterChain};
+//! use eventually::serde;
+//! use serde_json::json;
+//!
+//! let chain = UpcasterChain::new()
+//!     .register(FnUpcaster::new("UserCreated", 1, 2, |mut p| {
+//!         // v1 had "name", v2 splits it into "first_name" / "last_name"
+//!         let name = p["name"].as_str().unwrap_or("").to_owned();
+//!         let parts: Vec<_> = name.splitn(2, ' ').collect();
+//!         p["first_name"] = json!(parts.first().copied().unwrap_or(""));
+//!         p["last_name"]  = json!(parts.get(1).copied().unwrap_or(""));
+//!         p.as_object_mut().unwrap().remove("name");
+//!         p
+//!     }));
+//!
+//! let store = Store::new(pool, serde::Json::<MyEvent>::default())
+//!     .await?
+//!     .with_schema_version(2)
+//!     .with_upcaster_chain(chain);
+//! ```
 
 #![deny(unsafe_code, unused_qualifications, trivial_casts)]
 #![deny(clippy::all, clippy::pedantic, clippy::cargo)]
@@ -39,7 +75,14 @@
 #[cfg(not(any(feature = "postgres", feature = "sqlite", feature = "mysql")))]
 compile_error!("At least one database feature must be enabled: postgres, sqlite, mysql");
 
+/// Raw event store: append events to a stream and stream them back.
+///
+/// The [`Store`](event::Store) type implements both
+/// [`Appender`](eventually::event::store::Appender) and
+/// [`Streamer`](eventually::event::store::Streamer) and supports PostgreSQL,
+/// SQLite and MySQL transparently via `sqlx::AnyPool`.
 pub mod event;
+pub mod upcasting;
 
 // Exactly one of `aggregate` or `snapshot` is compiled in, depending on
 // whether the `snapshots` feature is active.

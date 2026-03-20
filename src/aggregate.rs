@@ -10,8 +10,34 @@
 //! every save.  Optimistic locking is performed in application code:
 //! the current `version` is read inside the transaction and compared to
 //! the expected version before writing.
+//!
+//! # Schema versioning
+//!
+//! The [`Repository`] forwards `schema_version` and an [`UpcasterChain`] to
+//! its inner [`event::Store`], so all event reads go through the upcasting
+//! pipeline automatically.
+//!
+//! ```rust,ignore
+//! use eventually_any::aggregate::Repository;
+//! use eventually_any::upcasting::{FnUpcaster, UpcasterChain};
+//! use eventually::serde;
+//! use serde_json::json;
+//!
+//! let chain = UpcasterChain::new()
+//!     .register(FnUpcaster::new("UserCreated", 1, 2, |mut p| {
+//!         p["full_name"] = p["name"].clone();
+//!         p.as_object_mut().unwrap().remove("name");
+//!         p
+//!     }));
+//!
+//! let repo = Repository::new(pool, serde::Json::default(), serde::Json::default())
+//!     .await?
+//!     .with_schema_version(2)
+//!     .with_upcaster_chain(chain);
+//! ```
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -19,6 +45,9 @@ use eventually::aggregate::Aggregate;
 use eventually::version::Version;
 use eventually::{aggregate, serde, version};
 use sqlx::{Any, AnyPool, Row};
+
+use crate::event::DEFAULT_SCHEMA_VERSION;
+use crate::upcasting::UpcasterChain;
 
 /// Classic mutable-row [`eventually::aggregate::Repository`] for SQL databases.
 #[derive(Debug, Clone)]
@@ -33,6 +62,8 @@ where
     aggregate_serde: Serde,
     event_serde: EvtSerde,
     backend: String,
+    schema_version: u32,
+    upcaster_chain: Arc<UpcasterChain>,
     t: PhantomData<T>,
 }
 
@@ -67,8 +98,24 @@ where
             aggregate_serde,
             event_serde,
             backend,
+            schema_version: DEFAULT_SCHEMA_VERSION,
+            upcaster_chain: Arc::new(UpcasterChain::new()),
             t: PhantomData,
         })
+    }
+
+    /// Set the schema version stamped on newly-written events.
+    #[must_use]
+    pub fn with_schema_version(mut self, version: u32) -> Self {
+        self.schema_version = version;
+        self
+    }
+
+    /// Attach an [`UpcasterChain`] applied to events at read time.
+    #[must_use]
+    pub fn with_upcaster_chain(mut self, chain: UpcasterChain) -> Self {
+        self.upcaster_chain = Arc::new(chain);
+        self
     }
 }
 
@@ -209,7 +256,6 @@ where
                 .await
             {
                 Ok(res) if res.rows_affected() == 0 => {
-                    // Another writer updated the version concurrently.
                     let actual_row = sqlx::query(&select_query)
                         .bind(aggregate_id)
                         .bind(T::type_name())
@@ -391,6 +437,7 @@ where
             &self.event_serde,
             &aggregate_id,
             root.version() as i32,
+            self.schema_version,
             events_to_commit,
         )
         .await

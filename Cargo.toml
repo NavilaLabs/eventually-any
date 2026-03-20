@@ -21,7 +21,7 @@ sqlx = { version = "0.8.6", features = [
 thiserror = "2.0.18"
 
 [dev-dependencies]
-tokio = { version = "1.50.0", features = ["macros", "rt"] }
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread"] }
 eventually-macros = { git = "https://github.com/get-eventually/eventually-rs", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 rand = "0.10.0"
@@ -39,5 +39,45 @@ migrations = []
 snapshots = []
 
 [[example]]
-name = "minimal"
-path = "examples/minimal.rs"
+name = "bank_account"
+path = "examples/bank_account.rs"
+# Demonstrates the full aggregate lifecycle: open, deposit, withdraw, reload,
+# domain errors, and closing. Uses the classic aggregate::Repository.
+# Run: cargo run --example bank_account --features sqlite,migrations
+
+
+[[example]]
+name = "order_lifecycle"
+path = "examples/order_lifecycle.rs"
+# Demonstrates raw event-store usage: multi-batch appends, VersionSelect::All,
+# VersionSelect::From (checkpoint resume), metadata inspection, and projection
+# rebuilding.
+# Run: cargo run --example order_lifecycle --features sqlite,migrations
+
+[[example]]
+name = "concurrent_writes"
+path = "examples/concurrent_writes.rs"
+# Demonstrates Optimistic Concurrency Control at both the event-store and
+# aggregate-repository levels, plus a realistic optimistic retry loop.
+# Run: cargo run --example concurrent_writes --features sqlite,migrations
+
+[[example]]
+name = "snapshot_repository"
+path = "examples/snapshot_repository.rs"
+# Demonstrates the snapshot::Repository: append-only snapshots, full audit
+# trail, delta replay, and two aggregate types coexisting in the same table.
+# Run: cargo run --example snapshot_repository --features sqlite,snapshots,migrations
+
+[[example]]
+name = "multi_schema_upcasting"
+path = "examples/multi_schema_upcasting.rs"
+# Demonstrates three-generation schema migration (V1→V2→V3) using named-struct
+# Upcaster implementations, chained automatically by UpcasterChain.
+# Run: cargo run --example multi_schema_upcasting --features sqlite,migrations
+
+[[example]]
+name = "multi_database"
+path = "examples/multi_database.rs"
+# Demonstrates running identical domain logic against SQLite, PostgreSQL, and
+# MySQL by switching only the connection string. Asserts identical results.
+# Run: cargo run --example multi_database --features sqlite,postgres,mysql,migrations
