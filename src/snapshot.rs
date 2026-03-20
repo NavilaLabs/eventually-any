@@ -20,7 +20,7 @@
 //!
 //! Every [`Repository::save`] call:
 //! 1. Appends the uncommitted events to the `events` table (always).
-//! 2. If the new aggregate version is a multiple of `snapshot_every` (default: 50),
+//! 2. If the new aggregate version is a multiple of `snapshot_every` (default: 100),
 //!    **also** writes a new snapshot row to the `snapshots` table.
 //!
 //! ## Loading
@@ -68,8 +68,8 @@ use sqlx::{AnyPool, Row};
 use crate::event::DEFAULT_SCHEMA_VERSION;
 use crate::upcasting::UpcasterChain;
 
-/// Default: write a snapshot every 50 events.
-pub const DEFAULT_SNAPSHOT_EVERY: usize = 50;
+/// Default: write a snapshot every 100 events.
+pub const DEFAULT_SNAPSHOT_EVERY: usize = 100;
 
 /// Periodic-snapshot [`eventually::aggregate::Repository`] for SQL databases.
 ///
@@ -78,7 +78,7 @@ pub const DEFAULT_SNAPSHOT_EVERY: usize = 50;
 ///
 /// Events are **always** appended. A snapshot is only written when the
 /// aggregate version crosses a multiple of [`Self::with_snapshot_every`]
-/// (default: 50).
+/// (default: 100).
 #[derive(Debug, Clone)]
 pub struct Repository<T, Serde, EvtSerde>
 where
