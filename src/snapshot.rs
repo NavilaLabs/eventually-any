@@ -16,43 +16,11 @@
 //! | Load strategy | O(1) state read | Latest snapshot + delta event replay |
 //! | Audit trail | ❌ Events only via raw store | ✅ Complete event history always |
 //!
-//! ## Saving
+//! # Tracing
 //!
-//! Every [`Repository::save`] call:
-//! 1. Appends the uncommitted events to the `events` table (always).
-//! 2. If the new aggregate version is a multiple of `snapshot_every` (default: 100),
-//!    **also** writes a new snapshot row to the `snapshots` table.
-//!
-//! ## Loading
-//!
-//! [`Repository::get`] uses *snapshot + delta replay*:
-//! 1. Read the most-recent snapshot row for `(aggregate_type, aggregate_id)`.
-//! 2. Stream all `events` with `version > snapshot.version` (the delta).
-//! 3. Fold delta events via [`eventually::aggregate::Aggregate::apply`].
-//! 4. Wrap the final state in [`aggregate::Root::rehydrate_from_state`].
-//!
-//! If no snapshot exists yet, the full event stream is replayed from the
-//! beginning — identical to how [`crate::aggregate::Repository`] always works,
-//! but without the O(1) guarantee until the first snapshot is written.
-//!
-//! ## Configuring the snapshot interval
-//!
-//! ```rust,ignore
-//! use eventually_any::snapshot::Repository;
-//!
-//! let repo = Repository::new(pool, state_serde, event_serde)
-//!     .await?
-//!     .with_snapshot_every(100); // snapshot every 100 events
-//! ```
-//!
-//! Set to `1` to snapshot on every save (equivalent to the old behaviour).
-//! Set to `usize::MAX` to effectively disable snapshotting (pure event replay).
-//!
-//! # Schema versioning
-//!
-//! The [`Repository`] forwards `schema_version` and an [`UpcasterChain`] to
-//! its inner event store, so all delta-replay reads go through the upcasting
-//! pipeline automatically.
+//! When the `tracing` feature is enabled, `get` and `save` open `INFO`-level
+//! spans.  Snapshot reads/writes, delta replays, and conflicts are recorded
+//! at `DEBUG` or `WARN` as appropriate.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -66,10 +34,11 @@ use futures::TryStreamExt;
 use sqlx::{AnyPool, Row};
 
 use crate::event::DEFAULT_SCHEMA_VERSION;
+use crate::logging::{debug, error, info, span, warn};
 use crate::upcasting::UpcasterChain;
 
-/// Default: write a snapshot every 100 events.
-pub const DEFAULT_SNAPSHOT_EVERY: usize = 100;
+/// Default: write a snapshot every 50 events.
+pub const DEFAULT_SNAPSHOT_EVERY: usize = 50;
 
 /// Periodic-snapshot [`eventually::aggregate::Repository`] for SQL databases.
 ///
@@ -78,7 +47,7 @@ pub const DEFAULT_SNAPSHOT_EVERY: usize = 100;
 ///
 /// Events are **always** appended. A snapshot is only written when the
 /// aggregate version crosses a multiple of [`Self::with_snapshot_every`]
-/// (default: 100).
+/// (default: 50).
 #[derive(Debug, Clone)]
 pub struct Repository<T, Serde, EvtSerde>
 where
@@ -123,6 +92,13 @@ where
             .unwrap_or_default();
 
         crate::run_migrations(&pool).await?;
+
+        info!(
+            aggregate_type = T::type_name(),
+            backend = %backend,
+            snapshot_every = DEFAULT_SNAPSHOT_EVERY,
+            "snapshot repository initialised"
+        );
 
         Ok(Self {
             pool,
@@ -197,7 +173,6 @@ where
     }
 
     /// Fetch the latest snapshot for `(aggregate_type, aggregate_id)`.
-    /// Returns `(snapshot_version, state_bytes)` or `None` if none exists yet.
     async fn latest_snapshot(
         &self,
         aggregate_id: &str,
@@ -244,8 +219,6 @@ where
     }
 
     /// Write a snapshot row inside an existing transaction.
-    ///
-    /// Called only when `new_version % snapshot_every == 0`.
     async fn write_snapshot_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -282,17 +255,31 @@ where
         sqlx::query(&snap_insert)
             .bind(T::type_name())
             .bind(aggregate_id)
-            .bind(aggregate_id) // event_stream_id == aggregate_id
+            .bind(aggregate_id)
             .bind(new_version)
             .bind(state_bytes)
             .execute(&mut **tx)
             .await
             .map_err(|err| {
+                error!(
+                    aggregate_id = aggregate_id,
+                    aggregate_type = T::type_name(),
+                    version = new_version,
+                    error = %err,
+                    "failed to write snapshot"
+                );
                 aggregate::repository::SaveError::Internal(anyhow!(
                     "failed to insert snapshot row: {}",
                     err
                 ))
             })?;
+
+        debug!(
+            aggregate_id = aggregate_id,
+            aggregate_type = T::type_name(),
+            version = new_version,
+            "snapshot written"
+        );
 
         Ok(())
     }
@@ -312,11 +299,30 @@ where
     async fn get(&self, id: &T::Id) -> Result<aggregate::Root<T>, aggregate::repository::GetError> {
         let aggregate_id = id.to_string();
 
+        let _span = span!(
+            "snapshot_repository::get",
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name()
+        );
+
+        info!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            "loading aggregate (snapshot + delta)"
+        );
+
         // ── Step 1: latest snapshot (may be None) ─────────────────────────
         let snapshot = self.latest_snapshot(&aggregate_id).await?;
 
         let (base_state, replay_from): (Option<T>, Version) = match snapshot {
-            None => (None, 0),
+            None => {
+                debug!(
+                    aggregate_id = %aggregate_id,
+                    aggregate_type = T::type_name(),
+                    "no snapshot found — full event replay"
+                );
+                (None, 0)
+            }
             Some((snap_version, state_bytes)) => {
                 let aggregate: T =
                     self.aggregate_serde
@@ -327,11 +333,17 @@ where
                                 err
                             ))
                         })?;
+                debug!(
+                    aggregate_id = %aggregate_id,
+                    aggregate_type = T::type_name(),
+                    snapshot_version = snap_version,
+                    "snapshot loaded"
+                );
                 (Some(aggregate), snap_version)
             }
         };
 
-        // ── Step 2: stream delta events (from snapshot version + 1) ───────
+        // ── Step 2: stream delta events ───────────────────────────────────
         let from_select = if replay_from == 0 {
             event::VersionSelect::All
         } else {
@@ -362,8 +374,24 @@ where
                 })?
         };
 
+        let delta_count = delta_events.len();
+        if delta_count > 0 {
+            debug!(
+                aggregate_id = %aggregate_id,
+                aggregate_type = T::type_name(),
+                from_version = replay_from,
+                delta_events = delta_count,
+                "replaying delta events"
+            );
+        }
+
         // ── Step 3: nothing at all → NotFound ─────────────────────────────
         if base_state.is_none() && delta_events.is_empty() {
+            warn!(
+                aggregate_id = %aggregate_id,
+                aggregate_type = T::type_name(),
+                "aggregate not found"
+            );
             return Err(aggregate::repository::GetError::NotFound);
         }
 
@@ -387,7 +415,15 @@ where
 
         match final_state {
             None => Err(aggregate::repository::GetError::NotFound),
-            Some(agg) => Ok(aggregate::Root::rehydrate_from_state(final_version, agg)),
+            Some(agg) => {
+                debug!(
+                    aggregate_id = %aggregate_id,
+                    aggregate_type = T::type_name(),
+                    version = final_version,
+                    "aggregate loaded (snapshot + delta)"
+                );
+                Ok(aggregate::Root::rehydrate_from_state(final_version, agg))
+            }
         }
     }
 }
@@ -409,14 +445,44 @@ where
         let events_to_commit = root.take_uncommitted_events();
 
         if events_to_commit.is_empty() {
+            debug!(
+                aggregate_type = T::type_name(),
+                "save called with no uncommitted events — skipping"
+            );
             return Ok(());
         }
 
         let aggregate_id = root.aggregate_id().to_string();
+        let event_count = events_to_commit.len();
         let new_version = root.version() as i32;
         let expected_version = root.version() - (events_to_commit.len() as Version);
 
+        let will_snapshot =
+            self.snapshot_every > 0 && (root.version() as usize) % self.snapshot_every == 0;
+
+        let _span = span!(
+            "snapshot_repository::save",
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            events = event_count,
+            snapshot = will_snapshot
+        );
+
+        info!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            events = event_count,
+            new_version = new_version,
+            snapshot = will_snapshot,
+            "saving aggregate"
+        );
+
         let mut tx = self.pool.begin().await.map_err(|err| {
+            error!(
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "failed to begin save transaction"
+            );
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to begin transaction: {}",
                 err
@@ -435,16 +501,9 @@ where
                 })?;
         }
 
-        // ── OCC: upsert event_streams with version check ───────────────────
-        //
-        // We use event_streams as the OCC fence — the same table the raw
-        // event store uses. This means concurrent saves to the same aggregate
-        // will correctly conflict even though we no longer have a single
-        // mutable aggregates row to compare against.
         self.upsert_event_stream(&mut tx, &aggregate_id, expected_version, new_version)
             .await?;
 
-        // ── Always: append events ─────────────────────────────────────────
         #[allow(clippy::cast_possible_truncation)]
         crate::event::append_domain_events(
             &mut tx,
@@ -456,33 +515,42 @@ where
         )
         .await
         .map_err(|err| {
+            error!(
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "failed to append events in snapshot save"
+            );
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to append domain events: {}",
                 err
             ))
         })?;
 
-        // ── Conditionally: write snapshot ─────────────────────────────────
-        //
-        // A snapshot is written when the new version is a positive multiple
-        // of `snapshot_every`.  This means:
-        //   - snapshot_every = 1  → every save
-        //   - snapshot_every = 50 → versions 50, 100, 150, …
-        //   - snapshot_every = MAX → never (pure event replay)
-        let should_snapshot =
-            self.snapshot_every > 0 && (root.version() as usize) % self.snapshot_every == 0;
-
-        if should_snapshot {
+        if will_snapshot {
             self.write_snapshot_in_tx(&mut tx, &aggregate_id, new_version, root)
                 .await?;
         }
 
         tx.commit().await.map_err(|err| {
+            error!(
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "failed to commit snapshot save transaction"
+            );
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to commit transaction: {}",
                 err
             ))
         })?;
+
+        debug!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            new_version = new_version,
+            events = event_count,
+            snapshot_written = will_snapshot,
+            "aggregate saved successfully"
+        );
 
         Ok(())
     }
@@ -507,7 +575,6 @@ where
         let (p1, p2) = (self.ph(1), self.ph(2));
 
         if expected_version == 0 {
-            // First save: INSERT the stream row.
             let insert =
                 format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
             if let Err(err) = sqlx::query(&insert)
@@ -518,11 +585,6 @@ where
             {
                 let is_dup = err.as_database_error().map_or(false, |e| {
                     let code = e.code().unwrap_or_default();
-                    // 23505 = Postgres unique violation
-                    // 1062  = MySQL duplicate entry
-                    // 23000 = MySQL integrity constraint
-                    // 2067  = SQLite UNIQUE constraint (extended code)
-                    // 1555  = SQLite PRIMARY KEY constraint (extended code, seen in practice)
                     code == "23505"
                         || code == "1062"
                         || code == "23000"
@@ -530,6 +592,12 @@ where
                         || code == "1555"
                 });
                 if is_dup {
+                    warn!(
+                        aggregate_id = aggregate_id,
+                        aggregate_type = T::type_name(),
+                        expected = expected_version,
+                        "save conflict (duplicate stream insert)"
+                    );
                     return Err(aggregate::repository::SaveError::Conflict(
                         version::ConflictError {
                             expected: expected_version,
@@ -543,7 +611,6 @@ where
                 )));
             }
         } else {
-            // Subsequent saves: UPDATE only when version matches — this is the OCC check.
             let (p3) = self.ph(3);
             let update = format!(
                 "UPDATE event_streams SET version = {p1}
@@ -557,8 +624,6 @@ where
                 .await
             {
                 Ok(res) if res.rows_affected() == 0 => {
-                    // No row matched — someone else advanced the version.
-                    // Read the actual current version for a useful error message.
                     let sel = if self.backend == "MySQL" {
                         "SELECT version FROM event_streams WHERE event_stream_id = ?"
                     } else {
@@ -573,6 +638,13 @@ where
                         .and_then(|r| r.try_get("version").ok())
                         .unwrap_or(0);
 
+                    warn!(
+                        aggregate_id = aggregate_id,
+                        aggregate_type = T::type_name(),
+                        expected = expected_version,
+                        actual = actual,
+                        "save conflict (zero rows affected on stream update)"
+                    );
                     return Err(aggregate::repository::SaveError::Conflict(
                         version::ConflictError {
                             expected: expected_version,
@@ -586,6 +658,12 @@ where
                         .as_database_error()
                         .map_or(false, |e| e.code().unwrap_or_default() == "40001");
                     if is_serial {
+                        warn!(
+                            aggregate_id = aggregate_id,
+                            aggregate_type = T::type_name(),
+                            expected = expected_version,
+                            "save conflict (serialization failure)"
+                        );
                         return Err(aggregate::repository::SaveError::Conflict(
                             version::ConflictError {
                                 expected: expected_version,

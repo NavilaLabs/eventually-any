@@ -17,24 +17,10 @@
 //! its inner [`event::Store`], so all event reads go through the upcasting
 //! pipeline automatically.
 //!
-//! ```rust,ignore
-//! use eventually_any::aggregate::Repository;
-//! use eventually_any::upcasting::{FnUpcaster, UpcasterChain};
-//! use eventually::serde;
-//! use serde_json::json;
+//! # Tracing
 //!
-//! let chain = UpcasterChain::new()
-//!     .register(FnUpcaster::new("UserCreated", 1, 2, |mut p| {
-//!         p["full_name"] = p["name"].clone();
-//!         p.as_object_mut().unwrap().remove("name");
-//!         p
-//!     }));
-//!
-//! let repo = Repository::new(pool, serde::Json::default(), serde::Json::default())
-//!     .await?
-//!     .with_schema_version(2)
-//!     .with_upcaster_chain(chain);
-//! ```
+//! When the `tracing` feature is enabled, `get` and `save` open `INFO`-level
+//! spans.  Conflicts are recorded at `WARN`, internal errors at `ERROR`.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -47,6 +33,7 @@ use eventually::{aggregate, serde, version};
 use sqlx::{Any, AnyPool, Row};
 
 use crate::event::DEFAULT_SCHEMA_VERSION;
+use crate::logging::{debug, error, info, span, warn};
 use crate::upcasting::UpcasterChain;
 
 /// Classic mutable-row [`eventually::aggregate::Repository`] for SQL databases.
@@ -93,6 +80,12 @@ where
 
         crate::run_migrations(&pool).await?;
 
+        info!(
+            aggregate_type = T::type_name(),
+            backend = %backend,
+            "aggregate repository initialised"
+        );
+
         Ok(Self {
             pool,
             aggregate_serde,
@@ -128,7 +121,6 @@ where
     Serde: serde::Serde<T> + Send + Sync,
     EvtSerde: serde::Serde<T::Event> + Send + Sync,
 {
-    /// Returns the correct SQL column quotation for `type` per backend.
     fn type_col(&self) -> &'static str {
         if self.backend == "MySQL" {
             "`type`"
@@ -137,7 +129,6 @@ where
         }
     }
 
-    /// Returns `?` (MySQL) or `$N` (Postgres/SQLite) placeholder style.
     fn ph(&self, n: usize) -> String {
         if self.backend == "MySQL" {
             "?".to_owned()
@@ -166,7 +157,6 @@ where
         let type_col = self.type_col();
         let (p1, p2, p3, p4, p5) = (self.ph(1), self.ph(2), self.ph(3), self.ph(4), self.ph(5));
 
-        // ── Read current version inside the transaction ───────────────────
         let select_query = format!(
             "SELECT version FROM aggregates WHERE aggregate_id = {p1} AND {type_col} = {p2}",
         );
@@ -188,6 +178,13 @@ where
             .unwrap_or(0);
 
         if actual_version != expected_version as i32 {
+            warn!(
+                aggregate_id = aggregate_id,
+                aggregate_type = T::type_name(),
+                expected = expected_version,
+                actual = actual_version,
+                "save conflict"
+            );
             return Err(aggregate::repository::SaveError::Conflict(
                 version::ConflictError {
                     expected: expected_version,
@@ -196,7 +193,6 @@ where
             ));
         }
 
-        // ── First save: INSERT both event_stream and aggregate rows ───────
         if expected_version == 0 {
             let stream_insert =
                 format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
@@ -211,6 +207,12 @@ where
                     code == "23505" || code == "1062" || code == "23000" || code == "2067"
                 });
                 if is_dup {
+                    warn!(
+                        aggregate_id = aggregate_id,
+                        aggregate_type = T::type_name(),
+                        expected = expected_version,
+                        "save conflict (duplicate stream insert)"
+                    );
                     return Err(aggregate::repository::SaveError::Conflict(
                         version::ConflictError {
                             expected: expected_version,
@@ -241,8 +243,6 @@ where
                         err
                     ))
                 })?;
-
-        // ── Subsequent saves: UPDATE both rows ────────────────────────────
         } else {
             let stream_update = format!(
                 "UPDATE event_streams SET version = {p1}
@@ -270,6 +270,13 @@ where
                     let actual: i32 = actual_row
                         .map(|row: sqlx::any::AnyRow| row.try_get("version").unwrap_or(0))
                         .unwrap_or(0);
+                    warn!(
+                        aggregate_id = aggregate_id,
+                        aggregate_type = T::type_name(),
+                        expected = expected_version,
+                        actual = actual,
+                        "save conflict (zero rows affected on stream update)"
+                    );
                     return Err(aggregate::repository::SaveError::Conflict(
                         version::ConflictError {
                             expected: expected_version,
@@ -283,6 +290,12 @@ where
                         .as_database_error()
                         .map_or(false, |e| e.code().unwrap_or_default() == "40001");
                     if is_serial {
+                        warn!(
+                            aggregate_id = aggregate_id,
+                            aggregate_type = T::type_name(),
+                            expected = expected_version,
+                            "save conflict (serialization failure)"
+                        );
                         return Err(aggregate::repository::SaveError::Conflict(
                             version::ConflictError {
                                 expected: expected_version,
@@ -336,6 +349,18 @@ where
         let type_col = self.type_col();
         let (p1, p2) = (self.ph(1), self.ph(2));
 
+        let _span = span!(
+            "aggregate_repository::get",
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name()
+        );
+
+        info!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            "loading aggregate"
+        );
+
         let query_str = format!(
             "SELECT version, state FROM aggregates
              WHERE aggregate_id = {p1} AND {type_col} = {p2}"
@@ -347,11 +372,26 @@ where
             .fetch_one(&self.pool)
             .await
             .map_err(|err| match err {
-                sqlx::Error::RowNotFound => aggregate::repository::GetError::NotFound,
-                _ => aggregate::repository::GetError::Internal(anyhow!(
-                    "failed to fetch aggregate state row: {}",
-                    err
-                )),
+                sqlx::Error::RowNotFound => {
+                    warn!(
+                        aggregate_id = %aggregate_id,
+                        aggregate_type = T::type_name(),
+                        "aggregate not found"
+                    );
+                    aggregate::repository::GetError::NotFound
+                }
+                _ => {
+                    error!(
+                        aggregate_id = %aggregate_id,
+                        aggregate_type = T::type_name(),
+                        error = %err,
+                        "database error loading aggregate"
+                    );
+                    aggregate::repository::GetError::Internal(anyhow!(
+                        "failed to fetch aggregate state row: {}",
+                        err
+                    ))
+                }
             })?;
 
         let version: i32 = row.try_get("version").map_err(|err| {
@@ -378,6 +418,13 @@ where
                 ))
             })?;
 
+        debug!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            version = version,
+            "aggregate loaded"
+        );
+
         #[allow(clippy::cast_sign_loss)]
         Ok(aggregate::Root::rehydrate_from_state(
             version as Version,
@@ -403,10 +450,36 @@ where
         let events_to_commit = root.take_uncommitted_events();
 
         if events_to_commit.is_empty() {
+            debug!(
+                aggregate_type = T::type_name(),
+                "save called with no uncommitted events — skipping"
+            );
             return Ok(());
         }
 
+        let aggregate_id = root.aggregate_id().to_string();
+        let event_count = events_to_commit.len();
+
+        let _span = span!(
+            "aggregate_repository::save",
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            events = event_count
+        );
+
+        info!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            events = event_count,
+            "saving aggregate"
+        );
+
         let mut tx = self.pool.begin().await.map_err(|err| {
+            error!(
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "failed to begin save transaction"
+            );
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to begin transaction: {}",
                 err
@@ -425,7 +498,6 @@ where
                 })?;
         }
 
-        let aggregate_id = root.aggregate_id().to_string();
         let expected_root_version = root.version() - (events_to_commit.len() as Version);
 
         self.save_aggregate_state(&mut tx, &aggregate_id, expected_root_version, root)
@@ -442,6 +514,11 @@ where
         )
         .await
         .map_err(|err| {
+            error!(
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "failed to append aggregate events"
+            );
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to append aggregate events: {}",
                 err
@@ -449,11 +526,24 @@ where
         })?;
 
         tx.commit().await.map_err(|err| {
+            error!(
+                aggregate_id = %aggregate_id,
+                error = %err,
+                "failed to commit save transaction"
+            );
             aggregate::repository::SaveError::Internal(anyhow!(
                 "failed to commit transaction: {}",
                 err
             ))
         })?;
+
+        debug!(
+            aggregate_id = %aggregate_id,
+            aggregate_type = T::type_name(),
+            new_version = root.version(),
+            events = event_count,
+            "aggregate saved successfully"
+        );
 
         Ok(())
     }

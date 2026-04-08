@@ -14,6 +14,7 @@ use futures::{StreamExt, TryStreamExt};
 use sqlx::any::AnyRow;
 use sqlx::{Any, AnyPool, Row, Transaction};
 
+use crate::logging::{debug, error, info, span, warn};
 use crate::upcasting::UpcasterChain;
 
 // ── Error types ───────────────────────────────────────────────────────────
@@ -67,9 +68,6 @@ where
         "recorded-with-new-version".to_owned(),
         new_event_stream_version.to_string(),
     );
-    // Embed the schema version in metadata so it survives without a dedicated
-    // column on databases that don't support ALTER TABLE easily.  The column
-    // is the source of truth when present; metadata is the fallback.
     metadata.insert("schema-version".to_owned(), schema_version.to_string());
 
     let metadata_string = serde_json::to_string(&metadata).unwrap();
@@ -95,6 +93,14 @@ where
         .bind(metadata_string)
         .execute(&mut **tx)
         .await?;
+
+    debug!(
+        stream_id = event_stream_id,
+        event_type = event_type,
+        version = event_version,
+        schema_version = schema_version,
+        "event row inserted"
+    );
 
     Ok(())
 }
@@ -144,6 +150,12 @@ where
 /// [`UpcasterChain`] transforms any stored payload to the current schema
 /// before deserialisation.  On write, the store stamps all new events with
 /// [`Store::schema_version`] (default `1`).
+///
+/// ## Tracing
+///
+/// When the `tracing` feature is enabled, every `append` and `stream` call
+/// opens an `INFO`-level span.  Individual row inserts and conflict errors
+/// are recorded at `DEBUG` and `WARN` respectively.
 ///
 /// ### Configuring
 ///
@@ -201,6 +213,8 @@ where
 
         crate::run_migrations(&pool).await?;
 
+        info!(backend = %backend, "event store initialised");
+
         Ok(Self {
             pool,
             serde,
@@ -213,10 +227,6 @@ where
     }
 
     /// Set the schema version that will be written to **new** events.
-    ///
-    /// Increment this whenever you introduce a breaking change to an event's
-    /// payload format and register a corresponding [`Upcaster`](crate::upcasting::Upcaster)
-    /// via [`Self::with_upcaster_chain`].
     #[must_use]
     pub fn with_schema_version(mut self, version: u32) -> Self {
         self.schema_version = version;
@@ -290,14 +300,10 @@ where
         let mut event_bytes: Vec<u8> = try_get_column(row, "event")?;
 
         // ── Resolve schema_version ─────────────────────────────────────────
-        // Primary source: the dedicated `schema_version` column.
-        // Fallback: the `schema-version` key embedded in `metadata` (written
-        // by older rows that pre-date the column, or in case of a migration).
         let stored_schema_version: u32 = row
             .try_get::<i32, _>("schema_version")
             .map(|v| v as u32)
             .unwrap_or_else(|_| {
-                // Try to recover from metadata field
                 try_get_column::<String>(row, "metadata")
                     .or_else(|_| {
                         try_get_column::<Vec<u8>>(row, "metadata")
@@ -315,22 +321,27 @@ where
 
         // ── Apply upcaster chain ───────────────────────────────────────────
         if stored_schema_version < self.schema_version || !self.upcaster_chain.is_empty() {
-            // Parse the raw bytes as JSON, upcast, re-serialise.
-            // This is only done when there are upcasters or the version is old.
             if let Ok(json_payload) = serde_json::from_slice::<serde_json::Value>(&event_bytes) {
-                let (upcasted_payload, _new_version) = self.upcaster_chain.apply(
+                let (upcasted_payload, new_version) = self.upcaster_chain.apply(
                     &event_type_column,
                     stored_schema_version,
                     json_payload,
                 );
-                // Re-encode as bytes for the domain deserialiser.
+                if new_version != stored_schema_version {
+                    debug!(
+                        stream_id = %stream_id.to_string(),
+                        event_type = %event_type_column,
+                        from_schema_version = stored_schema_version,
+                        to_schema_version = new_version,
+                        "event upcasted"
+                    );
+                }
                 if let Ok(new_bytes) = serde_json::to_vec(&upcasted_payload) {
                     event_bytes = new_bytes;
                 }
             }
         }
 
-        // Metadata is stored as JSONB (Postgres), JSON (MySQL) or TEXT (SQLite).
         let metadata_column: String = try_get_column(row, "metadata").or_else(|_| {
             try_get_column::<Vec<u8>>(row, "metadata")
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -339,10 +350,15 @@ where
         let metadata: Metadata = serde_json::from_str(&metadata_column)
             .map_err(|e| StreamError::DeserializeEvent(e.into()))?;
 
-        let deserialized_event = self
-            .serde
-            .deserialize(&event_bytes)
-            .map_err(StreamError::DeserializeEvent)?;
+        let deserialized_event = self.serde.deserialize(&event_bytes).map_err(|e| {
+            error!(
+                stream_id = %stream_id.to_string(),
+                event_type = %event_type_column,
+                version = version_column,
+                "failed to deserialize event"
+            );
+            StreamError::DeserializeEvent(e)
+        })?;
 
         #[allow(clippy::cast_sign_loss)]
         Ok(event::Persisted {
@@ -376,6 +392,18 @@ where
             event::VersionSelect::All => 0,
             event::VersionSelect::From(v) => v as i32,
         };
+
+        let select_str = match select {
+            event::VersionSelect::All => "All",
+            event::VersionSelect::From(_) => "From",
+        };
+
+        info!(
+            stream_id = %id.to_string(),
+            select = select_str,
+            from_version = from_version,
+            "streaming events"
+        );
 
         let query_str = match self.backend.as_str() {
             "PostgreSQL" => {
@@ -426,12 +454,34 @@ where
         events: Vec<event::Envelope<Evt>>,
     ) -> Result<Version, event::store::AppendError> {
         let string_id = id.to_string();
+        let event_count = events.len();
+
+        let version_check_str = match version_check {
+            version::Check::Any => "Any".to_owned(),
+            version::Check::MustBe(v) => format!("MustBe({v})"),
+        };
+
+        let _span = span!(
+            "event_store::append",
+            stream_id = %string_id,
+            events = event_count,
+            version_check = %version_check_str
+        );
+
+        info!(
+            stream_id = %string_id,
+            events = event_count,
+            version_check = %version_check_str,
+            "appending events"
+        );
+
         let mut attempts = 0;
 
         let (mut tx, new_version) = loop {
             attempts += 1;
 
             let mut tx = self.pool.begin().await.map_err(|err| {
+                error!(stream_id = %string_id, error = %err, "failed to begin transaction");
                 event::store::AppendError::Internal(anyhow!("failed to begin transaction: {}", err))
             })?;
 
@@ -470,6 +520,12 @@ where
 
             if let version::Check::MustBe(v) = version_check {
                 if current_version != v as i32 {
+                    warn!(
+                        stream_id = %string_id,
+                        expected = v,
+                        actual = current_version,
+                        "append conflict"
+                    );
                     return Err(event::store::AppendError::Conflict(
                         version::ConflictError {
                             expected: v,
@@ -519,6 +575,12 @@ where
                             let actual: i32 = actual_row
                                 .map(|row| row.try_get("version").unwrap_or(0))
                                 .unwrap_or(0);
+                            warn!(
+                                stream_id = %string_id,
+                                expected = v,
+                                actual = actual,
+                                "append conflict (zero rows affected)"
+                            );
                             return Err(event::store::AppendError::Conflict(
                                 version::ConflictError {
                                     expected: v,
@@ -526,6 +588,7 @@ where
                                 },
                             ));
                         } else if attempts < 3 {
+                            debug!(stream_id = %string_id, attempt = attempts, "retrying append");
                             continue;
                         } else {
                             return Err(event::store::AppendError::Internal(anyhow!(
@@ -547,6 +610,11 @@ where
 
                     if is_conflict {
                         if let version::Check::MustBe(v) = version_check {
+                            warn!(
+                                stream_id = %string_id,
+                                expected = v,
+                                "append conflict (db constraint)"
+                            );
                             return Err(event::store::AppendError::Conflict(
                                 version::ConflictError {
                                     expected: v,
@@ -554,6 +622,7 @@ where
                                 },
                             ));
                         } else if attempts < 3 {
+                            debug!(stream_id = %string_id, attempt = attempts, "retrying append after conflict");
                             continue;
                         } else {
                             return Err(event::store::AppendError::Internal(anyhow!(
@@ -562,6 +631,7 @@ where
                             )));
                         }
                     } else {
+                        error!(stream_id = %string_id, error = %err, "database error during append");
                         return Err(event::store::AppendError::Internal(anyhow!(
                             "failed to append event stream: {}",
                             err
@@ -581,6 +651,7 @@ where
         )
         .await
         .map_err(|err| {
+            error!(stream_id = %string_id, error = %err, "failed to write event rows");
             event::store::AppendError::Internal(anyhow!(
                 "failed to append new domain events: {}",
                 err
@@ -588,10 +659,20 @@ where
         })?;
 
         tx.commit().await.map_err(|err| {
+            error!(stream_id = %string_id, error = %err, "failed to commit append transaction");
             event::store::AppendError::Internal(anyhow!("failed to commit transaction: {}", err))
         })?;
 
         #[allow(clippy::cast_sign_loss)]
-        Ok(new_version as Version)
+        let new_version = new_version as Version;
+
+        debug!(
+            stream_id = %string_id,
+            new_version = new_version,
+            events = event_count,
+            "events appended successfully"
+        );
+
+        Ok(new_version)
     }
 }

@@ -11,6 +11,7 @@
 //! | `mysql`      | Enable MySQL support via sqlx |
 //! | `migrations` | Embed and auto-run SQL migrations on repository/store construction |
 //! | `snapshots`  | Replace the classic `aggregate` module with the `snapshot` module (see below) |
+//! | `tracing`    | Emit structured trace/debug/info/warn/error events via the `tracing` crate |
 //! | `full`       | Enable all of the above |
 //!
 //! # Aggregate repository: two modes
@@ -45,11 +46,48 @@
 //! Old events stored in the database are transparently upgraded at read time;
 //! no data migration is required.
 //!
+//! # Tracing
+//!
+//! Enable the `tracing` feature to get structured instrumentation of all
+//! store and repository operations.  The crate integrates with the
+//! [`tracing`](https://docs.rs/tracing) ecosystem, so any compatible
+//! subscriber works out of the box:
+//!
+//! ```toml
+//! [dependencies]
+//! eventually-any      = { version = "0.1", features = ["tracing"] }
+//! tracing-subscriber  = "0.3"
+//! ```
+//!
+//! ```rust,no_run
+//! tracing_subscriber::fmt::init();
+//! ```
+//!
+//! Spans and events emitted (all prefixed with the module path):
+//!
+//! | Level | Name | Key fields |
+//! |-------|------|------------|
+//! | INFO  | `event_store::append` | `stream_id`, `events`, `version_check` |
+//! | INFO  | `event_store::stream` | `stream_id`, `select` |
+//! | DEBUG | `event_store::append::committed` | `stream_id`, `new_version` |
+//! | WARN  | `event_store::append::conflict` | `stream_id`, `expected`, `actual` |
+//! | INFO  | `aggregate_repository::save` | `aggregate_id`, `aggregate_type`, `events` |
+//! | INFO  | `aggregate_repository::get` | `aggregate_id`, `aggregate_type` |
+//! | DEBUG | `aggregate_repository::save::committed` | `aggregate_id`, `new_version` |
+//! | WARN  | `aggregate_repository::save::conflict` | `aggregate_id`, `expected`, `actual` |
+//! | DEBUG | `aggregate_repository::get::found` | `aggregate_id`, `version` |
+//! | WARN  | `aggregate_repository::get::not_found` | `aggregate_id` |
+//! | INFO  | `snapshot_repository::save` | `aggregate_id`, `aggregate_type`, `events`, `snapshot` |
+//! | INFO  | `snapshot_repository::get` | `aggregate_id`, `aggregate_type` |
+//! | DEBUG | `snapshot_repository::get::snapshot_loaded` | `aggregate_id`, `snapshot_version` |
+//! | DEBUG | `snapshot_repository::get::delta_replay` | `aggregate_id`, `from_version`, `events` |
+//! | DEBUG | `snapshot_repository::save::snapshot_written` | `aggregate_id`, `version` |
+//! | WARN  | `snapshot_repository::save::conflict` | `aggregate_id`, `expected`, `actual` |
+//!
 //! ```rust,ignore
-//! use eventually_any::event::Store;
-//! use eventually_any::upcasting::{FnUpcaster, UpcasterChain};
+//! use eventually::event::store::{Appender, Streamer};
 //! use eventually::serde;
-//! use serde_json::json;
+//! use eventually_any::event::Store;
 //!
 //! let chain = UpcasterChain::new()
 //!     .register(FnUpcaster::new("UserCreated", 1, 2, |mut p| {
@@ -83,6 +121,9 @@ compile_error!("At least one database feature must be enabled: postgres, sqlite,
 /// SQLite and MySQL transparently via `sqlx::AnyPool`.
 pub mod event;
 pub mod upcasting;
+
+// Internal logging shims — zero-cost when `tracing` feature is off.
+pub(crate) mod logging;
 
 // Exactly one of `aggregate` or `snapshot` is compiled in, depending on
 // whether the `snapshots` feature is active.
