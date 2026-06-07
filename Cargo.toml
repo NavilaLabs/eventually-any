@@ -1,7 +1,10 @@
 [package]
 name = "eventually-any"
+description = "PostgreSQL, SQLite, and MySQL backend for the eventually event-sourcing framework, powered by sqlx::AnyPool"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0"

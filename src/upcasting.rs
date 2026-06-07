@@ -76,8 +76,6 @@
 
 use serde_json::Value;
 
-// ── Core trait ────────────────────────────────────────────────────────────
-
 /// A single version-to-version JSON payload transformation for one event type.
 ///
 /// Implementations must be **pure** (no I/O, no side effects): they receive
@@ -96,8 +94,6 @@ pub trait Upcaster: Send + Sync {
     /// Transform the raw JSON payload from `from_version` to `to_version`.
     fn upcast(&self, payload: Value) -> Value;
 }
-
-// ── Chain ─────────────────────────────────────────────────────────────────
 
 /// An ordered registry of [`Upcaster`]s.
 ///
@@ -176,8 +172,6 @@ impl std::fmt::Debug for UpcasterChain {
     }
 }
 
-// ── Closure-based convenience ─────────────────────────────────────────────
-
 /// An [`Upcaster`] created from a plain closure — useful for simple, inline
 /// transformations where a named struct is overkill.
 ///
@@ -245,8 +239,6 @@ impl std::fmt::Debug for FnUpcaster {
             .finish()
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

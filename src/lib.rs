@@ -111,7 +111,37 @@
 #![warn(missing_docs)]
 
 #[cfg(not(any(feature = "postgres", feature = "sqlite", feature = "mysql")))]
-compile_error!("At least one database feature must be enabled: postgres, sqlite, mysql");
+compile_error!(
+    "eventually-any: At least one database feature must be enabled: postgres, sqlite, mysql"
+);
+
+/// No-op shims for `tracing` macros used unconditionally throughout the crate.
+/// This module is compiled only when the `tracing` feature is disabled, making
+/// every `debug!`, `info!`, `warn!`, `error!`, and `span!` call a zero-cost
+/// no-op without requiring conditional compilation at each call site.
+#[cfg(not(feature = "tracing"))]
+#[macro_use]
+mod tracing_noop {
+    macro_rules! debug {
+        ($($t:tt)*) => {};
+    }
+    macro_rules! info {
+        ($($t:tt)*) => {};
+    }
+    macro_rules! warn {
+        ($($t:tt)*) => {};
+    }
+    macro_rules! error {
+        ($($t:tt)*) => {};
+    }
+    macro_rules! span {
+        ($($t:tt)*) => {
+            ()
+        };
+    }
+}
+
+pub(crate) mod backend;
 
 /// Raw event store: append events to a stream and stream them back.
 ///
@@ -122,15 +152,11 @@ compile_error!("At least one database feature must be enabled: postgres, sqlite,
 pub mod event;
 pub mod upcasting;
 
-// Exactly one of `aggregate` or `snapshot` is compiled in, depending on
-// whether the `snapshots` feature is active.
 #[cfg(not(feature = "snapshots"))]
 pub mod aggregate;
 
 #[cfg(feature = "snapshots")]
 pub mod snapshot;
-
-// ── Embedded migrations ───────────────────────────────────────────────────
 
 #[cfg(all(
     feature = "postgres",
@@ -156,8 +182,6 @@ pub(crate) static MIGRATIONS_MYSQL: sqlx::migrate::Migrator =
 #[cfg(all(feature = "mysql", feature = "migrations", feature = "snapshots"))]
 pub(crate) static MIGRATIONS_MYSQL: sqlx::migrate::Migrator =
     sqlx::migrate!("./migrations/snapshots/mysql");
-
-// ── Internal migration helper ─────────────────────────────────────────────
 
 /// Run whichever embedded migration set matches the pool's backend.
 /// No-op when the `migrations` feature is disabled.

@@ -14,22 +14,10 @@ use futures::{StreamExt, TryStreamExt};
 use sqlx::any::AnyRow;
 use sqlx::{Any, AnyPool, Row, Transaction};
 
+use crate::backend::{Backend, is_conflict_error_code};
 use crate::upcasting::UpcasterChain;
 #[cfg(feature = "tracing")]
 use tracing::{debug, error, info, info_span as span, warn};
-
-#[cfg(not(feature = "tracing"))]
-macro_rules! debug { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! info { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! warn { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! error { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! span { ($($t:tt)*) => { () }; }
-
-// ── Error types ───────────────────────────────────────────────────────────
 
 /// Errors that can occur while streaming events from the database.
 #[derive(Debug, thiserror::Error)]
@@ -52,27 +40,26 @@ pub enum StreamError {
     Database(#[source] sqlx::Error),
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────
-
 /// The default schema version written for new events when none is specified.
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) async fn append_domain_event<Evt>(
-    tx: &mut Transaction<'_, Any>,
-    serde: &impl serde::Serializer<Evt>,
+    transaction: &mut Transaction<'_, Any>,
+    backend: &Backend,
+    serializer: &impl serde::Serializer<Evt>,
     event_stream_id: &str,
     event_version: i32,
     new_event_stream_version: i32,
     schema_version: u32,
-    event: event::Envelope<Evt>,
+    envelope: event::Envelope<Evt>,
 ) -> anyhow::Result<()>
 where
     Evt: Message,
 {
-    let event_type = event.message.name();
-    let mut metadata = event.metadata;
-    let serialized_event = serde
-        .serialize(event.message)
+    let event_type = envelope.message.name();
+    let mut metadata = envelope.metadata;
+    let serialized_event = serializer
+        .serialize(envelope.message)
         .map_err(|err| anyhow!("failed to serialize event message: {}", err))?;
 
     metadata.insert("recorded-at".to_owned(), Utc::now().to_rfc3339());
@@ -82,28 +69,31 @@ where
     );
     metadata.insert("schema-version".to_owned(), schema_version.to_string());
 
-    let metadata_string = serde_json::to_string(&metadata).unwrap();
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
 
-    let backend = tx.backend_name();
-    let query_str = if backend == "PostgreSQL" {
-        r#"INSERT INTO events (event_stream_id, "type", "version", schema_version, event, metadata)
-           VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb))"#
-    } else if backend == "MySQL" {
-        r"INSERT INTO events (event_stream_id, `type`, `version`, schema_version, event, metadata)
-          VALUES (?, ?, ?, ?, ?, ?)"
-    } else {
-        r#"INSERT INTO events (event_stream_id, "type", "version", schema_version, event, metadata)
-           VALUES ($1, $2, $3, $4, $5, $6)"#
+    let sql = match backend {
+        Backend::Postgres => {
+            r#"INSERT INTO events (event_stream_id, "type", "version", schema_version, event, metadata)
+               VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb))"#
+        }
+        Backend::MySQL => {
+            r"INSERT INTO events (event_stream_id, `type`, `version`, schema_version, event, metadata)
+              VALUES (?, ?, ?, ?, ?, ?)"
+        }
+        Backend::Sqlite => {
+            r#"INSERT INTO events (event_stream_id, "type", "version", schema_version, event, metadata)
+               VALUES ($1, $2, $3, $4, $5, $6)"#
+        }
     };
 
-    sqlx::query(query_str)
+    sqlx::query(sql)
         .bind(event_stream_id)
         .bind(event_type)
         .bind(event_version)
         .bind(schema_version as i32)
         .bind(serialized_event)
-        .bind(metadata_string)
-        .execute(&mut **tx)
+        .bind(metadata_json)
+        .execute(&mut **transaction)
         .await?;
 
     debug!(
@@ -118,8 +108,9 @@ where
 }
 
 pub(crate) async fn append_domain_events<Evt>(
-    tx: &mut Transaction<'_, Any>,
-    serde: &impl serde::Serializer<Evt>,
+    transaction: &mut Transaction<'_, Any>,
+    backend: &Backend,
+    serializer: &impl serde::Serializer<Evt>,
     event_stream_id: &str,
     new_version: i32,
     schema_version: u32,
@@ -131,18 +122,19 @@ where
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let current_event_stream_version = new_version - (events.len() as i32);
 
-    for (i, evt) in events.into_iter().enumerate() {
+    for (index, envelope) in events.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let event_version = current_event_stream_version + (i as i32) + 1;
+        let event_version = current_event_stream_version + (index as i32) + 1;
 
         append_domain_event(
-            tx,
-            serde,
+            transaction,
+            backend,
+            serializer,
             event_stream_id,
             event_version,
             new_version,
             schema_version,
-            evt,
+            envelope,
         )
         .await?;
     }
@@ -150,7 +142,116 @@ where
     Ok(())
 }
 
-// ── Store ─────────────────────────────────────────────────────────────────
+/// Outcome returned by [`upsert_event_stream`].
+pub(crate) enum StreamUpsertOutcome {
+    Success,
+    Conflict(version::ConflictError),
+}
+
+/// Insert (first save) or update (subsequent saves) the `event_streams` row,
+/// using `expected_version` as an optimistic lock.
+///
+/// Returns [`StreamUpsertOutcome::Conflict`] when another writer has already
+/// advanced the stream past `expected_version`.  Returns an error only for
+/// unexpected database failures.
+pub(crate) async fn upsert_event_stream(
+    transaction: &mut Transaction<'_, Any>,
+    backend: &Backend,
+    aggregate_id: &str,
+    expected_version: Version,
+    new_version: i32,
+) -> anyhow::Result<StreamUpsertOutcome> {
+    let placeholder_1 = backend.placeholder(1);
+    let placeholder_2 = backend.placeholder(2);
+
+    if expected_version == 0 {
+        let insert_sql = format!(
+            "INSERT INTO event_streams (event_stream_id, version) VALUES ({placeholder_1}, {placeholder_2})"
+        );
+        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(insert_sql))
+            .bind(aggregate_id)
+            .bind(new_version)
+            .execute(&mut **transaction)
+            .await
+        {
+            let is_duplicate = err
+                .as_database_error()
+                .is_some_and(|database_err| is_conflict_error_code(&database_err.code().unwrap_or_default()));
+
+            if is_duplicate {
+                warn!(
+                    aggregate_id = aggregate_id,
+                    expected = expected_version,
+                    "save conflict (duplicate stream insert)"
+                );
+                return Ok(StreamUpsertOutcome::Conflict(version::ConflictError {
+                    expected: expected_version,
+                    actual: expected_version + 1,
+                }));
+            }
+            return Err(anyhow!("failed to insert event stream: {}", err));
+        }
+    } else {
+        let placeholder_3 = backend.placeholder(3);
+        let update_sql = format!(
+            "UPDATE event_streams SET version = {placeholder_1}
+             WHERE event_stream_id = {placeholder_2} AND version = {placeholder_3}"
+        );
+        match sqlx::query(sqlx::AssertSqlSafe(update_sql))
+            .bind(new_version)
+            .bind(aggregate_id)
+            .bind(expected_version as i32)
+            .execute(&mut **transaction)
+            .await
+        {
+            Ok(result) if result.rows_affected() == 0 => {
+                let select_sql = format!(
+                    "SELECT version FROM event_streams WHERE event_stream_id = {placeholder_1}"
+                );
+                let actual_version: i32 = sqlx::query(sqlx::AssertSqlSafe(select_sql))
+                    .bind(aggregate_id)
+                    .fetch_optional(&mut **transaction)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.try_get("version").ok())
+                    .unwrap_or(0);
+
+                warn!(
+                    aggregate_id = aggregate_id,
+                    expected = expected_version,
+                    actual = actual_version,
+                    "save conflict (zero rows affected on stream update)"
+                );
+                return Ok(StreamUpsertOutcome::Conflict(version::ConflictError {
+                    expected: expected_version,
+                    actual: actual_version as Version,
+                }));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let is_serialization_failure = err
+                    .as_database_error()
+                    .is_some_and(|database_err| database_err.code().unwrap_or_default() == "40001");
+
+                if is_serialization_failure {
+                    warn!(
+                        aggregate_id = aggregate_id,
+                        expected = expected_version,
+                        "save conflict (serialization failure)"
+                    );
+                    return Ok(StreamUpsertOutcome::Conflict(version::ConflictError {
+                        expected: expected_version,
+                        actual: expected_version + 1,
+                    }));
+                }
+                return Err(anyhow!("failed to update event stream: {}", err));
+            }
+        }
+    }
+
+    Ok(StreamUpsertOutcome::Success)
+}
 
 /// `sqlx::Any`-backed [`event::Store`] implementation.
 ///
@@ -177,10 +278,10 @@ where
 /// use eventually::serde;
 ///
 /// let chain = UpcasterChain::new()
-///     .register(FnUpcaster::new("UserCreated", 1, 2, |mut p| {
-///         p["full_name"] = p["name"].clone();
-///         p.as_object_mut().unwrap().remove("name");
-///         p
+///     .register(FnUpcaster::new("UserCreated", 1, 2, |mut payload| {
+///         payload["full_name"] = payload["name"].clone();
+///         payload.as_object_mut().unwrap().remove("name");
+///         payload
 ///     }));
 ///
 /// let store = Store::new(pool, serde::Json::<UserEvent>::default())
@@ -196,10 +297,8 @@ where
 {
     pool: AnyPool,
     serde: Serde,
-    backend: String,
-    /// Schema version stamped on every newly-written event.
+    backend: Backend,
     schema_version: u32,
-    /// Upcaster chain applied to events on read.
     upcaster_chain: Arc<UpcasterChain>,
     id_type: PhantomData<Id>,
     evt_type: PhantomData<Evt>,
@@ -217,15 +316,17 @@ where
     ///
     /// Returns an error if the migrations fail to run.
     pub async fn new(pool: AnyPool, serde: Serde) -> Result<Self, sqlx::migrate::MigrateError> {
-        let backend = pool
+        let backend_name = pool
             .acquire()
             .await
-            .map(|c| c.backend_name().to_string())
+            .map(|connection| connection.backend_name().to_string())
             .unwrap_or_default();
+
+        let backend = Backend::from_name(&backend_name);
 
         crate::run_migrations(&pool).await?;
 
-        info!(backend = %backend, "event store initialised");
+        info!(backend = %backend_name, "event store initialised");
 
         Ok(Self {
             pool,
@@ -258,16 +359,13 @@ where
         self.schema_version
     }
 
-    /// Create a [`Store`] that skips migrations.
-    ///
-    /// `pub(crate)` — used by [`crate::snapshot::Repository`] to build a
-    /// lightweight streamer for delta-event replay inside `get()`, where
-    /// migrations have already been run by the outer `Repository::new`.
+    /// Build a streamer that skips migrations — used inside snapshot `get()`
+    /// where migrations have already been run by the outer `Repository::new`.
     #[cfg(feature = "snapshots")]
     pub(crate) fn new_unchecked(
         pool: AnyPool,
         serde: &Serde,
-        backend: &str,
+        backend: Backend,
         schema_version: u32,
         upcaster_chain: Arc<UpcasterChain>,
     ) -> Self
@@ -277,7 +375,7 @@ where
         Self {
             pool,
             serde: serde.clone(),
-            backend: backend.to_owned(),
+            backend,
             schema_version,
             upcaster_chain,
             id_type: PhantomData,
@@ -285,8 +383,6 @@ where
         }
     }
 }
-
-// ── Row helper ────────────────────────────────────────────────────────────
 
 fn try_get_column<T>(row: &AnyRow, name: &'static str) -> Result<T, StreamError>
 where
@@ -311,40 +407,41 @@ where
         let event_type_column: String = try_get_column(row, "type")?;
         let mut event_bytes: Vec<u8> = try_get_column(row, "event")?;
 
-        // ── Resolve schema_version ─────────────────────────────────────────
         let stored_schema_version: u32 = row
             .try_get::<i32, _>("schema_version")
-            .map(|v| v as u32)
+            .map(|version| version as u32)
             .unwrap_or_else(|_| {
                 try_get_column::<String>(row, "metadata")
                     .or_else(|_| {
                         try_get_column::<Vec<u8>>(row, "metadata")
-                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                     })
                     .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| {
-                        v.get("schema-version")
-                            .and_then(|sv| sv.as_str())
-                            .and_then(|sv| sv.parse::<u32>().ok())
+                    .and_then(|metadata_string| {
+                        serde_json::from_str::<serde_json::Value>(&metadata_string).ok()
+                    })
+                    .and_then(|metadata_value| {
+                        metadata_value
+                            .get("schema-version")
+                            .and_then(|schema_version| schema_version.as_str())
+                            .and_then(|schema_version| schema_version.parse::<u32>().ok())
                     })
                     .unwrap_or(DEFAULT_SCHEMA_VERSION)
             });
 
-        // ── Apply upcaster chain ───────────────────────────────────────────
         if stored_schema_version < self.schema_version || !self.upcaster_chain.is_empty() {
             if let Ok(json_payload) = serde_json::from_slice::<serde_json::Value>(&event_bytes) {
-                let (upcasted_payload, new_version) = self.upcaster_chain.apply(
+                let (upcasted_payload, new_schema_version) = self.upcaster_chain.apply(
                     &event_type_column,
                     stored_schema_version,
                     json_payload,
                 );
-                if new_version != stored_schema_version {
+                if new_schema_version != stored_schema_version {
                     debug!(
                         stream_id = %stream_id.to_string(),
                         event_type = %event_type_column,
                         from_schema_version = stored_schema_version,
-                        to_schema_version = new_version,
+                        to_schema_version = new_schema_version,
                         "event upcasted"
                     );
                 }
@@ -360,16 +457,16 @@ where
         })?;
 
         let metadata: Metadata = serde_json::from_str(&metadata_column)
-            .map_err(|e| StreamError::DeserializeEvent(e.into()))?;
+            .map_err(|error| StreamError::DeserializeEvent(error.into()))?;
 
-        let deserialized_event = self.serde.deserialize(&event_bytes).map_err(|e| {
+        let deserialized_event = self.serde.deserialize(&event_bytes).map_err(|error| {
             error!(
                 stream_id = %stream_id.to_string(),
                 event_type = %event_type_column,
                 version = version_column,
                 "failed to deserialize event"
             );
-            StreamError::DeserializeEvent(e)
+            StreamError::DeserializeEvent(error)
         })?;
 
         #[allow(clippy::cast_sign_loss)]
@@ -384,8 +481,6 @@ where
     }
 }
 
-// ── Streamer ──────────────────────────────────────────────────────────────
-
 impl<Id, Evt, Serde> event::store::Streamer<Id, Evt> for Store<Id, Evt, Serde>
 where
     Id: ToString + Clone + Send + Sync,
@@ -394,6 +489,7 @@ where
 {
     type Error = StreamError;
 
+    #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
     fn stream(
         &self,
         id: &Id,
@@ -402,35 +498,35 @@ where
         #[allow(clippy::cast_possible_truncation)]
         let from_version: i32 = match select {
             event::VersionSelect::All => 0,
-            event::VersionSelect::From(v) => v as i32,
+            event::VersionSelect::From(version) => version as i32,
         };
 
-        let select_str = match select {
+        let version_select_label = match select {
             event::VersionSelect::All => "All",
             event::VersionSelect::From(_) => "From",
         };
 
         info!(
             stream_id = %id.to_string(),
-            select = select_str,
+            select = version_select_label,
             from_version = from_version,
             "streaming events"
         );
 
-        let query_str = match self.backend.as_str() {
-            "PostgreSQL" => {
+        let sql = match self.backend {
+            Backend::Postgres => {
                 r#"SELECT version, "type", schema_version, event, CAST(metadata AS text) as metadata
                    FROM events
                    WHERE event_stream_id = $1 AND version >= $2
                    ORDER BY version"#
             }
-            "MySQL" => {
+            Backend::MySQL => {
                 r"SELECT version, `type`, schema_version, event, CAST(metadata AS char) as metadata
                    FROM events
                    WHERE event_stream_id = ? AND version >= ?
                    ORDER BY version"
             }
-            _ => {
+            Backend::Sqlite => {
                 r#"SELECT version, "type", schema_version, event, metadata
                    FROM events
                    WHERE event_stream_id = $1 AND version >= $2
@@ -440,7 +536,7 @@ where
 
         let id = id.clone();
 
-        sqlx::query(query_str)
+        sqlx::query(sql)
             .bind(id.to_string())
             .bind(from_version)
             .fetch(&self.pool)
@@ -450,8 +546,6 @@ where
     }
 }
 
-// ── Appender ──────────────────────────────────────────────────────────────
-
 #[async_trait]
 impl<Id, Evt, Serde> event::store::Appender<Id, Evt> for Store<Id, Evt, Serde>
 where
@@ -459,6 +553,7 @@ where
     Evt: Message + Send + Sync,
     Serde: serde::Serde<Evt> + Send + Sync,
 {
+    #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
     async fn append(
         &self,
         id: Id,
@@ -468,56 +563,55 @@ where
         let string_id = id.to_string();
         let event_count = events.len();
 
-        let version_check_str = match version_check {
+        let version_check_label = match version_check {
             version::Check::Any => "Any".to_owned(),
-            version::Check::MustBe(v) => format!("MustBe({v})"),
+            version::Check::MustBe(version) => format!("MustBe({version})"),
         };
 
         let _span = span!(
             "event_store::append",
             stream_id = %string_id,
             events = event_count,
-            version_check = %version_check_str
+            version_check = %version_check_label
         );
 
         info!(
             stream_id = %string_id,
             events = event_count,
-            version_check = %version_check_str,
+            version_check = %version_check_label,
             "appending events"
         );
 
         let mut attempts = 0;
 
-        let (mut tx, new_version) = loop {
+        let (mut transaction, new_version) = loop {
             attempts += 1;
 
-            let mut tx = self.pool.begin().await.map_err(|err| {
+            let mut transaction = self.pool.begin().await.map_err(|err| {
                 error!(stream_id = %string_id, error = %err, "failed to begin transaction");
                 event::store::AppendError::Internal(anyhow!("failed to begin transaction: {}", err))
             })?;
 
-            if tx.backend_name() == "PostgreSQL" {
+            if self.backend.requires_serializable_isolation() {
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE DEFERRABLE")
-                    .execute(&mut *tx)
+                    .execute(&mut *transaction)
                     .await
                     .map_err(|err| {
                         event::store::AppendError::Internal(anyhow!(
-                            "failed to set transaction level: {}",
+                            "failed to set transaction isolation level: {}",
                             err
                         ))
                     })?;
             }
 
-            let select_query = if self.backend == "MySQL" {
-                "SELECT version FROM event_streams WHERE event_stream_id = ?"
-            } else {
-                "SELECT version FROM event_streams WHERE event_stream_id = $1"
-            };
+            let select_sql = format!(
+                "SELECT version FROM event_streams WHERE event_stream_id = {}",
+                self.backend.placeholder(1)
+            );
 
-            let current_version_row = sqlx::query(select_query)
+            let current_version_row = sqlx::query(sqlx::AssertSqlSafe(&*select_sql))
                 .bind(&string_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut *transaction)
                 .await
                 .map_err(|err| {
                     event::store::AppendError::Internal(anyhow!(
@@ -530,17 +624,17 @@ where
                 .map(|row| row.try_get("version").unwrap_or(0))
                 .unwrap_or(0);
 
-            if let version::Check::MustBe(v) = version_check {
-                if current_version != v as i32 {
+            if let version::Check::MustBe(expected) = version_check {
+                if current_version != expected as i32 {
                     warn!(
                         stream_id = %string_id,
-                        expected = v,
+                        expected = expected,
                         actual = current_version,
                         "append conflict"
                     );
                     return Err(event::store::AppendError::Conflict(
                         version::ConflictError {
-                            expected: v,
+                            expected,
                             actual: current_version as Version,
                         },
                     ));
@@ -550,53 +644,54 @@ where
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let new_version = current_version + events.len() as i32;
 
-            let stream_res = if current_version == 0 {
-                let insert_query = if self.backend == "MySQL" {
-                    "INSERT INTO event_streams (event_stream_id, version) VALUES (?, ?)"
-                } else {
-                    "INSERT INTO event_streams (event_stream_id, version) VALUES ($1, $2)"
-                };
-                sqlx::query(insert_query)
+            let stream_result = if current_version == 0 {
+                let insert_sql = format!(
+                    "INSERT INTO event_streams (event_stream_id, version) VALUES ({}, {})",
+                    self.backend.placeholder(1),
+                    self.backend.placeholder(2)
+                );
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql))
                     .bind(&string_id)
                     .bind(new_version)
-                    .execute(&mut *tx)
+                    .execute(&mut *transaction)
                     .await
             } else {
-                let update_query = if self.backend == "MySQL" {
-                    "UPDATE event_streams SET version = ? WHERE event_stream_id = ? AND version = ?"
-                } else {
-                    "UPDATE event_streams SET version = $1 WHERE event_stream_id = $2 AND version = $3"
-                };
-                sqlx::query(update_query)
+                let update_sql = format!(
+                    "UPDATE event_streams SET version = {} WHERE event_stream_id = {} AND version = {}",
+                    self.backend.placeholder(1),
+                    self.backend.placeholder(2),
+                    self.backend.placeholder(3)
+                );
+                sqlx::query(sqlx::AssertSqlSafe(update_sql))
                     .bind(new_version)
                     .bind(&string_id)
                     .bind(current_version)
-                    .execute(&mut *tx)
+                    .execute(&mut *transaction)
                     .await
             };
 
-            match stream_res {
-                Ok(res) => {
-                    if current_version > 0 && res.rows_affected() == 0 {
-                        if let version::Check::MustBe(v) = version_check {
-                            let actual_row = sqlx::query(select_query)
+            match stream_result {
+                Ok(result) => {
+                    if current_version > 0 && result.rows_affected() == 0 {
+                        if let version::Check::MustBe(expected) = version_check {
+                            let actual_row = sqlx::query(sqlx::AssertSqlSafe(&*select_sql))
                                 .bind(&string_id)
-                                .fetch_optional(&mut *tx)
+                                .fetch_optional(&mut *transaction)
                                 .await
                                 .unwrap_or(None);
-                            let actual: i32 = actual_row
+                            let actual_version: i32 = actual_row
                                 .map(|row| row.try_get("version").unwrap_or(0))
                                 .unwrap_or(0);
                             warn!(
                                 stream_id = %string_id,
-                                expected = v,
-                                actual = actual,
+                                expected = expected,
+                                actual = actual_version,
                                 "append conflict (zero rows affected)"
                             );
                             return Err(event::store::AppendError::Conflict(
                                 version::ConflictError {
-                                    expected: v,
-                                    actual: actual as Version,
+                                    expected,
+                                    actual: actual_version as Version,
                                 },
                             ));
                         } else if attempts < 3 {
@@ -608,29 +703,24 @@ where
                             )));
                         }
                     }
-                    break (tx, new_version);
+                    break (transaction, new_version);
                 }
                 Err(err) => {
-                    let is_conflict = err.as_database_error().map_or(false, |e| {
-                        let code = e.code().unwrap_or_default();
-                        code == "23505"
-                            || code == "1062"
-                            || code == "2067"
-                            || code == "40001"
-                            || code == "23000"
-                    });
+                    let is_conflict = err
+                        .as_database_error()
+                        .is_some_and(|database_err| is_conflict_error_code(&database_err.code().unwrap_or_default()));
 
                     if is_conflict {
-                        if let version::Check::MustBe(v) = version_check {
+                        if let version::Check::MustBe(expected) = version_check {
                             warn!(
                                 stream_id = %string_id,
-                                expected = v,
-                                "append conflict (db constraint)"
+                                expected = expected,
+                                "append conflict (database constraint)"
                             );
                             return Err(event::store::AppendError::Conflict(
                                 version::ConflictError {
-                                    expected: v,
-                                    actual: v + 1,
+                                    expected,
+                                    actual: expected + 1,
                                 },
                             ));
                         } else if attempts < 3 {
@@ -654,7 +744,8 @@ where
         };
 
         append_domain_events(
-            &mut tx,
+            &mut transaction,
+            &self.backend,
             &self.serde,
             &string_id,
             new_version,
@@ -670,7 +761,7 @@ where
             ))
         })?;
 
-        tx.commit().await.map_err(|err| {
+        transaction.commit().await.map_err(|err| {
             error!(stream_id = %string_id, error = %err, "failed to commit append transaction");
             event::store::AppendError::Internal(anyhow!("failed to commit transaction: {}", err))
         })?;

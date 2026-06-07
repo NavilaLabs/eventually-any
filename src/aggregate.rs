@@ -32,21 +32,11 @@ use eventually::version::Version;
 use eventually::{aggregate, serde, version};
 use sqlx::{Any, AnyPool, Row};
 
+use crate::backend::Backend;
 use crate::event::DEFAULT_SCHEMA_VERSION;
 use crate::upcasting::UpcasterChain;
 #[cfg(feature = "tracing")]
 use tracing::{debug, error, info, info_span as span, warn};
-
-#[cfg(not(feature = "tracing"))]
-macro_rules! debug { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! info { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! warn { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! error { ($($t:tt)*) => {}; }
-#[cfg(not(feature = "tracing"))]
-macro_rules! span { ($($t:tt)*) => { () }; }
 
 /// Classic mutable-row [`eventually::aggregate::Repository`] for SQL databases.
 #[derive(Debug, Clone)]
@@ -60,7 +50,7 @@ where
     pool: AnyPool,
     aggregate_serde: Serde,
     event_serde: EvtSerde,
-    backend: String,
+    backend: Backend,
     schema_version: u32,
     upcaster_chain: Arc<UpcasterChain>,
     t: PhantomData<T>,
@@ -84,17 +74,19 @@ where
         aggregate_serde: Serde,
         event_serde: EvtSerde,
     ) -> Result<Self, sqlx::migrate::MigrateError> {
-        let backend = pool
+        let backend_name = pool
             .acquire()
             .await
-            .map(|c| c.backend_name().to_string())
+            .map(|connection| connection.backend_name().to_string())
             .unwrap_or_default();
+
+        let backend = Backend::from_name(&backend_name);
 
         crate::run_migrations(&pool).await?;
 
         info!(
             aggregate_type = T::type_name(),
-            backend = %backend,
+            backend = %backend_name,
             "aggregate repository initialised"
         );
 
@@ -124,8 +116,6 @@ where
     }
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────
-
 impl<T, Serde, EvtSerde> Repository<T, Serde, EvtSerde>
 where
     T: Aggregate + Send + Sync,
@@ -133,30 +123,14 @@ where
     Serde: serde::Serde<T> + Send + Sync,
     EvtSerde: serde::Serde<T::Event> + Send + Sync,
 {
-    fn type_col(&self) -> &'static str {
-        if self.backend == "MySQL" {
-            "`type`"
-        } else {
-            r#""type""#
-        }
-    }
-
-    fn ph(&self, n: usize) -> String {
-        if self.backend == "MySQL" {
-            "?".to_owned()
-        } else {
-            format!("${n}")
-        }
-    }
-
     async fn save_aggregate_state(
         &self,
-        tx: &mut sqlx::Transaction<'_, Any>,
+        transaction: &mut sqlx::Transaction<'_, Any>,
         aggregate_id: &str,
         expected_version: Version,
         root: &mut aggregate::Root<T>,
     ) -> Result<(), aggregate::repository::SaveError> {
-        let bytes_state = self
+        let serialized_state = self
             .aggregate_serde
             .serialize(root.to_aggregate_type::<T>())
             .map_err(|err| {
@@ -166,17 +140,18 @@ where
                 ))
             })?;
 
-        let type_col = self.type_col();
-        let (p1, p2, p3, p4, p5) = (self.ph(1), self.ph(2), self.ph(3), self.ph(4), self.ph(5));
+        let type_column = self.backend.type_column();
+        let placeholder_1 = self.backend.placeholder(1);
+        let placeholder_2 = self.backend.placeholder(2);
 
         let select_query = format!(
-            "SELECT version FROM aggregates WHERE aggregate_id = {p1} AND {type_col} = {p2}",
+            "SELECT version FROM aggregates WHERE aggregate_id = {placeholder_1} AND {type_column} = {placeholder_2}",
         );
 
         let current_version_row = sqlx::query(sqlx::AssertSqlSafe(&*select_query))
             .bind(aggregate_id)
             .bind(T::type_name())
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|err| {
                 aggregate::repository::SaveError::Internal(anyhow!(
@@ -205,53 +180,36 @@ where
             ));
         }
 
-        if expected_version == 0 {
-            let stream_insert =
-                format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
-            if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(stream_insert))
-                .bind(aggregate_id)
-                .bind(root.version() as i32)
-                .execute(&mut **tx)
-                .await
-            {
-                let is_conflict = err.as_database_error().map_or(false, |e| {
-                    let code = e.code().unwrap_or_default();
-                    code == "23505"
-                        || code == "1062"
-                        || code == "23000"
-                        || code == "2067"
-                        || code == "40001"
-                });
-                if is_conflict {
-                    warn!(
-                        aggregate_id = aggregate_id,
-                        aggregate_type = T::type_name(),
-                        expected = expected_version,
-                        "save conflict (duplicate stream insert)"
-                    );
-                    return Err(aggregate::repository::SaveError::Conflict(
-                        version::ConflictError {
-                            expected: expected_version,
-                            actual: expected_version + 1,
-                        },
-                    ));
-                }
-                return Err(aggregate::repository::SaveError::Internal(anyhow!(
-                    "failed to insert event stream: {}",
-                    err
-                )));
+        match crate::event::upsert_event_stream(
+            transaction,
+            &self.backend,
+            aggregate_id,
+            expected_version,
+            root.version() as i32,
+        )
+        .await
+        .map_err(aggregate::repository::SaveError::Internal)?
+        {
+            crate::event::StreamUpsertOutcome::Conflict(conflict) => {
+                return Err(aggregate::repository::SaveError::Conflict(conflict))
             }
+            crate::event::StreamUpsertOutcome::Success => {}
+        }
 
-            let agg_insert = format!(
-                "INSERT INTO aggregates (aggregate_id, {type_col}, version, state)
-                 VALUES ({p1}, {p2}, {p3}, {p4})"
+        let placeholder_3 = self.backend.placeholder(3);
+        let placeholder_4 = self.backend.placeholder(4);
+
+        if expected_version == 0 {
+            let aggregate_insert = format!(
+                "INSERT INTO aggregates (aggregate_id, {type_column}, version, state)
+                 VALUES ({placeholder_1}, {placeholder_2}, {placeholder_3}, {placeholder_4})"
             );
-            sqlx::query(sqlx::AssertSqlSafe(agg_insert))
+            sqlx::query(sqlx::AssertSqlSafe(aggregate_insert))
                 .bind(aggregate_id)
                 .bind(T::type_name())
                 .bind(root.version() as i32)
-                .bind(bytes_state)
-                .execute(&mut **tx)
+                .bind(serialized_state)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|err| {
                     aggregate::repository::SaveError::Internal(anyhow!(
@@ -260,83 +218,18 @@ where
                     ))
                 })?;
         } else {
-            let stream_update = format!(
-                "UPDATE event_streams SET version = {p1}
-                 WHERE event_stream_id = {p2} AND version = {p3}"
+            let placeholder_5 = self.backend.placeholder(5);
+            let aggregate_update = format!(
+                "UPDATE aggregates SET version = {placeholder_1}, state = {placeholder_2}
+                 WHERE aggregate_id = {placeholder_3} AND {type_column} = {placeholder_4} AND version = {placeholder_5}"
             );
-            match sqlx::query(sqlx::AssertSqlSafe(stream_update))
+            sqlx::query(sqlx::AssertSqlSafe(aggregate_update))
                 .bind(root.version() as i32)
-                .bind(aggregate_id)
-                .bind(expected_version as i32)
-                .execute(&mut **tx)
-                .await
-            {
-                Ok(res) if res.rows_affected() == 0 => {
-                    let actual_row = sqlx::query(sqlx::AssertSqlSafe(&*select_query))
-                        .bind(aggregate_id)
-                        .bind(T::type_name())
-                        .fetch_optional(&mut **tx)
-                        .await
-                        .map_err(|err| {
-                            aggregate::repository::SaveError::Internal(anyhow!(
-                                "failed to fetch actual version: {}",
-                                err
-                            ))
-                        })?;
-                    let actual: i32 = actual_row
-                        .map(|row: sqlx::any::AnyRow| row.try_get("version").unwrap_or(0))
-                        .unwrap_or(0);
-                    warn!(
-                        aggregate_id = aggregate_id,
-                        aggregate_type = T::type_name(),
-                        expected = expected_version,
-                        actual = actual,
-                        "save conflict (zero rows affected on stream update)"
-                    );
-                    return Err(aggregate::repository::SaveError::Conflict(
-                        version::ConflictError {
-                            expected: expected_version,
-                            actual: actual as Version,
-                        },
-                    ));
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    let is_serial = err
-                        .as_database_error()
-                        .map_or(false, |e| e.code().unwrap_or_default() == "40001");
-                    if is_serial {
-                        warn!(
-                            aggregate_id = aggregate_id,
-                            aggregate_type = T::type_name(),
-                            expected = expected_version,
-                            "save conflict (serialization failure)"
-                        );
-                        return Err(aggregate::repository::SaveError::Conflict(
-                            version::ConflictError {
-                                expected: expected_version,
-                                actual: expected_version + 1,
-                            },
-                        ));
-                    }
-                    return Err(aggregate::repository::SaveError::Internal(anyhow!(
-                        "failed to update event stream: {}",
-                        err
-                    )));
-                }
-            }
-
-            let agg_update = format!(
-                "UPDATE aggregates SET version = {p1}, state = {p2}
-                 WHERE aggregate_id = {p3} AND {type_col} = {p4} AND version = {p5}"
-            );
-            sqlx::query(sqlx::AssertSqlSafe(agg_update))
-                .bind(root.version() as i32)
-                .bind(bytes_state)
+                .bind(serialized_state)
                 .bind(aggregate_id)
                 .bind(T::type_name())
                 .bind(expected_version as i32)
-                .execute(&mut **tx)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|err| {
                     aggregate::repository::SaveError::Internal(anyhow!(
@@ -350,8 +243,6 @@ where
     }
 }
 
-// ── Getter ────────────────────────────────────────────────────────────────
-
 #[async_trait]
 impl<T, Serde, EvtSerde> aggregate::repository::Getter<T> for Repository<T, Serde, EvtSerde>
 where
@@ -362,8 +253,9 @@ where
 {
     async fn get(&self, id: &T::Id) -> Result<aggregate::Root<T>, aggregate::repository::GetError> {
         let aggregate_id = id.to_string();
-        let type_col = self.type_col();
-        let (p1, p2) = (self.ph(1), self.ph(2));
+        let type_column = self.backend.type_column();
+        let placeholder_1 = self.backend.placeholder(1);
+        let placeholder_2 = self.backend.placeholder(2);
 
         let _span = span!(
             "aggregate_repository::get",
@@ -377,12 +269,12 @@ where
             "loading aggregate"
         );
 
-        let query_str = format!(
+        let select_query = format!(
             "SELECT version, state FROM aggregates
-             WHERE aggregate_id = {p1} AND {type_col} = {p2}"
+             WHERE aggregate_id = {placeholder_1} AND {type_column} = {placeholder_2}"
         );
 
-        let row = sqlx::query(sqlx::AssertSqlSafe(query_str))
+        let row = sqlx::query(sqlx::AssertSqlSafe(select_query))
             .bind(&aggregate_id)
             .bind(T::type_name())
             .fetch_one(&self.pool)
@@ -417,7 +309,7 @@ where
             ))
         })?;
 
-        let bytes_state: Vec<u8> = row.try_get("state").map_err(|err| {
+        let serialized_state: Vec<u8> = row.try_get("state").map_err(|err| {
             aggregate::repository::GetError::Internal(anyhow!(
                 "failed to get 'state' column: {}",
                 err
@@ -426,7 +318,7 @@ where
 
         let aggregate: T = self
             .aggregate_serde
-            .deserialize(&bytes_state)
+            .deserialize(&serialized_state)
             .map_err(|err| {
                 aggregate::repository::GetError::Internal(anyhow!(
                     "failed to deserialize aggregate state: {}",
@@ -449,8 +341,6 @@ where
     }
 }
 
-// ── Saver ─────────────────────────────────────────────────────────────────
-
 #[async_trait]
 impl<T, Serde, EvtSerde> aggregate::repository::Saver<T> for Repository<T, Serde, EvtSerde>
 where
@@ -459,10 +349,16 @@ where
     Serde: serde::Serde<T> + Send + Sync,
     EvtSerde: serde::Serde<T::Event> + Send + Sync,
 {
+    #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
     async fn save(
         &self,
         root: &mut aggregate::Root<T>,
     ) -> Result<(), aggregate::repository::SaveError> {
+        // NOTE: uncommitted events are drained here before the transaction begins.
+        // If the save fails with an Internal error (not Conflict), those events will
+        // no longer be present on `root`. The caller should treat any save failure
+        // as reason to reload the aggregate from the repository rather than retry
+        // directly.
         let events_to_commit = root.take_uncommitted_events();
 
         if events_to_commit.is_empty() {
@@ -490,7 +386,7 @@ where
             "saving aggregate"
         );
 
-        let mut tx = self.pool.begin().await.map_err(|err| {
+        let mut transaction = self.pool.begin().await.map_err(|err| {
             error!(
                 aggregate_id = %aggregate_id,
                 error = %err,
@@ -502,9 +398,9 @@ where
             ))
         })?;
 
-        if tx.backend_name() == "PostgreSQL" {
+        if self.backend.requires_serializable_isolation() {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE DEFERRABLE")
-                .execute(&mut *tx)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|err| {
                     aggregate::repository::SaveError::Internal(anyhow!(
@@ -516,12 +412,13 @@ where
 
         let expected_root_version = root.version() - (events_to_commit.len() as Version);
 
-        self.save_aggregate_state(&mut tx, &aggregate_id, expected_root_version, root)
+        self.save_aggregate_state(&mut transaction, &aggregate_id, expected_root_version, root)
             .await?;
 
         #[allow(clippy::cast_possible_truncation)]
         crate::event::append_domain_events(
-            &mut tx,
+            &mut transaction,
+            &self.backend,
             &self.event_serde,
             &aggregate_id,
             root.version() as i32,
@@ -541,7 +438,7 @@ where
             ))
         })?;
 
-        tx.commit().await.map_err(|err| {
+        transaction.commit().await.map_err(|err| {
             error!(
                 aggregate_id = %aggregate_id,
                 error = %err,
