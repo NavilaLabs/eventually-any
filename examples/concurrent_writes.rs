@@ -42,6 +42,7 @@ use eventually::event::Envelope;
 use eventually::event::store::{AppendError, Appender};
 use eventually::message::Message;
 use eventually::version;
+#[cfg(not(feature = "snapshots"))]
 use eventually_any::aggregate::Repository;
 use eventually_any::event::Store;
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,10 @@ impl CounterRoot {
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "snapshots")]
+fn main() {}
+
+#[cfg(not(feature = "snapshots"))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     install_default_drivers();

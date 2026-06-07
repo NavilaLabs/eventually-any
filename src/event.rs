@@ -14,8 +14,20 @@ use futures::{StreamExt, TryStreamExt};
 use sqlx::any::AnyRow;
 use sqlx::{Any, AnyPool, Row, Transaction};
 
-use crate::logging::{debug, error, info, span, warn};
 use crate::upcasting::UpcasterChain;
+#[cfg(feature = "tracing")]
+use tracing::{debug, error, info, info_span as span, warn};
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! debug { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! info { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! warn { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! error { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! span { ($($t:tt)*) => { () }; }
 
 // ── Error types ───────────────────────────────────────────────────────────
 

@@ -34,8 +34,20 @@ use futures::TryStreamExt;
 use sqlx::{AnyPool, Row};
 
 use crate::event::DEFAULT_SCHEMA_VERSION;
-use crate::logging::{debug, error, info, span, warn};
 use crate::upcasting::UpcasterChain;
+#[cfg(feature = "tracing")]
+use tracing::{debug, error, info, info_span as span, warn};
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! debug { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! info { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! warn { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! error { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! span { ($($t:tt)*) => { () }; }
 
 /// Default: write a snapshot every 50 events.
 pub const DEFAULT_SNAPSHOT_EVERY: usize = 50;
@@ -186,7 +198,7 @@ where
              ORDER BY {ver} DESC LIMIT 1"
         );
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(T::type_name())
             .bind(aggregate_id)
             .fetch_optional(&self.pool)
@@ -252,7 +264,7 @@ where
             )
         };
 
-        sqlx::query(&snap_insert)
+        sqlx::query(sqlx::AssertSqlSafe(snap_insert))
             .bind(T::type_name())
             .bind(aggregate_id)
             .bind(aggregate_id)
@@ -577,7 +589,7 @@ where
         if expected_version == 0 {
             let insert =
                 format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
-            if let Err(err) = sqlx::query(&insert)
+            if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(insert))
                 .bind(aggregate_id)
                 .bind(new_version)
                 .execute(&mut **tx)
@@ -590,6 +602,7 @@ where
                         || code == "23000"
                         || code == "2067"
                         || code == "1555"
+                        || code == "40001"
                 });
                 if is_dup {
                     warn!(
@@ -611,12 +624,12 @@ where
                 )));
             }
         } else {
-            let (p3) = self.ph(3);
+            let p3 = self.ph(3);
             let update = format!(
                 "UPDATE event_streams SET version = {p1}
                  WHERE event_stream_id = {p2} AND version = {p3}"
             );
-            match sqlx::query(&update)
+            match sqlx::query(sqlx::AssertSqlSafe(update))
                 .bind(new_version)
                 .bind(aggregate_id)
                 .bind(expected_version as i32)

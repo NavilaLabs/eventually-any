@@ -23,6 +23,7 @@ use eventually::aggregate::{
     repository::{Getter, Saver},
 };
 use eventually::message::Message;
+#[cfg(not(feature = "snapshots"))]
 use eventually_any::aggregate::Repository;
 use serde::{Deserialize, Serialize};
 use sqlx::any::install_default_drivers;
@@ -204,6 +205,10 @@ impl BankAccountRoot {
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "snapshots")]
+fn main() {}
+
+#[cfg(not(feature = "snapshots"))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     install_default_drivers();

@@ -59,7 +59,7 @@
 //! tracing-subscriber  = "0.3"
 //! ```
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! tracing_subscriber::fmt::init();
 //! ```
 //!
@@ -121,9 +121,6 @@ compile_error!("At least one database feature must be enabled: postgres, sqlite,
 /// SQLite and MySQL transparently via `sqlx::AnyPool`.
 pub mod event;
 pub mod upcasting;
-
-// Internal logging shims — zero-cost when `tracing` feature is off.
-pub(crate) mod logging;
 
 // Exactly one of `aggregate` or `snapshot` is compiled in, depending on
 // whether the `snapshots` feature is active.

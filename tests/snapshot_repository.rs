@@ -387,7 +387,10 @@ async fn multiple_aggregate_ids_coexist_without_interference_sqlite() {
 // ── MYSQL TESTS ───────────────────────────────────────────────────────────
 
 #[cfg(feature = "mysql")]
-async fn mysql_pool() -> sqlx::AnyPool {
+async fn mysql_pool() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Mysql>,
+    sqlx::AnyPool,
+) {
     let container = Mysql::default().start().await.expect("start");
     let (host, port) =
         futures::try_join!(container.get_host(), container.get_host_port_ipv4(3306)).unwrap();
@@ -401,35 +404,40 @@ async fn mysql_pool() -> sqlx::AnyPool {
         .unwrap();
     setup_pool.close().await;
 
-    sqlx::AnyPool::connect(&format!("mysql://root@{}:{}/test_db", host, port))
+    let pool = sqlx::AnyPool::connect(&format!("mysql://root@{}:{}/test_db", host, port))
         .await
-        .unwrap()
+        .unwrap();
+    (container, pool)
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn it_works_mysql() {
     install_default_drivers();
-    run_it_works(mysql_pool().await).await;
+    let (_container, pool) = mysql_pool().await;
+    run_it_works(pool).await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn it_detects_data_races_mysql() {
     install_default_drivers();
-    run_it_detects_data_races_and_returns_conflict_error(mysql_pool().await).await;
+    let (_container, pool) = mysql_pool().await;
+    run_it_detects_data_races_and_returns_conflict_error(pool).await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn snapshot_plus_delta_replay_produces_correct_state_mysql() {
     install_default_drivers();
-    run_snapshot_plus_delta_replay_produces_correct_state(mysql_pool().await).await;
+    let (_container, pool) = mysql_pool().await;
+    run_snapshot_plus_delta_replay_produces_correct_state(pool).await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn multiple_aggregate_ids_coexist_without_interference_mysql() {
     install_default_drivers();
-    run_multiple_aggregate_ids_coexist_without_interference(mysql_pool().await).await;
+    let (_container, pool) = mysql_pool().await;
+    run_multiple_aggregate_ids_coexist_without_interference(pool).await;
 }

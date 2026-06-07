@@ -33,8 +33,20 @@ use eventually::{aggregate, serde, version};
 use sqlx::{Any, AnyPool, Row};
 
 use crate::event::DEFAULT_SCHEMA_VERSION;
-use crate::logging::{debug, error, info, span, warn};
 use crate::upcasting::UpcasterChain;
+#[cfg(feature = "tracing")]
+use tracing::{debug, error, info, info_span as span, warn};
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! debug { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! info { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! warn { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! error { ($($t:tt)*) => {}; }
+#[cfg(not(feature = "tracing"))]
+macro_rules! span { ($($t:tt)*) => { () }; }
 
 /// Classic mutable-row [`eventually::aggregate::Repository`] for SQL databases.
 #[derive(Debug, Clone)]
@@ -161,7 +173,7 @@ where
             "SELECT version FROM aggregates WHERE aggregate_id = {p1} AND {type_col} = {p2}",
         );
 
-        let current_version_row = sqlx::query(&select_query)
+        let current_version_row = sqlx::query(sqlx::AssertSqlSafe(&*select_query))
             .bind(aggregate_id)
             .bind(T::type_name())
             .fetch_optional(&mut **tx)
@@ -196,17 +208,21 @@ where
         if expected_version == 0 {
             let stream_insert =
                 format!("INSERT INTO event_streams (event_stream_id, version) VALUES ({p1}, {p2})");
-            if let Err(err) = sqlx::query(&stream_insert)
+            if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(stream_insert))
                 .bind(aggregate_id)
                 .bind(root.version() as i32)
                 .execute(&mut **tx)
                 .await
             {
-                let is_dup = err.as_database_error().map_or(false, |e| {
+                let is_conflict = err.as_database_error().map_or(false, |e| {
                     let code = e.code().unwrap_or_default();
-                    code == "23505" || code == "1062" || code == "23000" || code == "2067"
+                    code == "23505"
+                        || code == "1062"
+                        || code == "23000"
+                        || code == "2067"
+                        || code == "40001"
                 });
-                if is_dup {
+                if is_conflict {
                     warn!(
                         aggregate_id = aggregate_id,
                         aggregate_type = T::type_name(),
@@ -230,7 +246,7 @@ where
                 "INSERT INTO aggregates (aggregate_id, {type_col}, version, state)
                  VALUES ({p1}, {p2}, {p3}, {p4})"
             );
-            sqlx::query(&agg_insert)
+            sqlx::query(sqlx::AssertSqlSafe(agg_insert))
                 .bind(aggregate_id)
                 .bind(T::type_name())
                 .bind(root.version() as i32)
@@ -248,7 +264,7 @@ where
                 "UPDATE event_streams SET version = {p1}
                  WHERE event_stream_id = {p2} AND version = {p3}"
             );
-            match sqlx::query(&stream_update)
+            match sqlx::query(sqlx::AssertSqlSafe(stream_update))
                 .bind(root.version() as i32)
                 .bind(aggregate_id)
                 .bind(expected_version as i32)
@@ -256,7 +272,7 @@ where
                 .await
             {
                 Ok(res) if res.rows_affected() == 0 => {
-                    let actual_row = sqlx::query(&select_query)
+                    let actual_row = sqlx::query(sqlx::AssertSqlSafe(&*select_query))
                         .bind(aggregate_id)
                         .bind(T::type_name())
                         .fetch_optional(&mut **tx)
@@ -314,7 +330,7 @@ where
                 "UPDATE aggregates SET version = {p1}, state = {p2}
                  WHERE aggregate_id = {p3} AND {type_col} = {p4} AND version = {p5}"
             );
-            sqlx::query(&agg_update)
+            sqlx::query(sqlx::AssertSqlSafe(agg_update))
                 .bind(root.version() as i32)
                 .bind(bytes_state)
                 .bind(aggregate_id)
@@ -366,7 +382,7 @@ where
              WHERE aggregate_id = {p1} AND {type_col} = {p2}"
         );
 
-        let row = sqlx::query(&query_str)
+        let row = sqlx::query(sqlx::AssertSqlSafe(query_str))
             .bind(&aggregate_id)
             .bind(T::type_name())
             .fetch_one(&self.pool)
